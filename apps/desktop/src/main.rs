@@ -10,6 +10,7 @@
 )]
 
 mod app;
+mod covers;
 mod ui;
 mod views;
 

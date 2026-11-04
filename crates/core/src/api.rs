@@ -30,6 +30,12 @@ pub(crate) trait JellyfinApi: Send + Sync {
     ) -> BoxFuture<'a, Result<ItemsPage>>;
     fn item<'a>(&'a self, item_id: &'a str) -> BoxFuture<'a, Result<Value>>;
     fn update_item<'a>(&'a self, item_id: &'a str, dto: &'a Value) -> BoxFuture<'a, Result<()>>;
+    fn image<'a>(
+        &'a self,
+        item_id: &'a str,
+        image_type: &'a str,
+        max_width: u32,
+    ) -> BoxFuture<'a, Result<Vec<u8>>>;
 }
 
 impl JellyfinApi for jellyfin::Client {
@@ -59,6 +65,17 @@ impl JellyfinApi for jellyfin::Client {
 
     fn update_item<'a>(&'a self, item_id: &'a str, dto: &'a Value) -> BoxFuture<'a, Result<()>> {
         Box::pin(jellyfin::Client::update_item(self, item_id, dto))
+    }
+
+    fn image<'a>(
+        &'a self,
+        item_id: &'a str,
+        image_type: &'a str,
+        max_width: u32,
+    ) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(jellyfin::Client::image(
+            self, item_id, image_type, max_width,
+        ))
     }
 }
 

@@ -94,7 +94,8 @@ impl AppState {
                         this.connect.error = None;
                         this.record_task("连接", message.clone(), true, cx);
                         this.notify_toast(message, cx);
-                        // The new connection may expose a different library set.
+                        // The new connection may expose a different server.
+                        this.covers.clear();
                         this.library.libraries.clear();
                         this.library.items.clear();
                         this.library.active_lib = None;

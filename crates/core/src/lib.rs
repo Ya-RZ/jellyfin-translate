@@ -48,6 +48,10 @@ pub enum TranslationStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonView {
+    /// Jellyfin person item id, used for the avatar image; absent for people
+    /// typed by hand in the edit dialog.
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub role: Option<String>,
 }
@@ -494,6 +498,19 @@ impl AppService {
         Ok(report)
     }
 
+    /// Raw bytes of an item's `Primary` image (poster/thumb), scaled to
+    /// `max_width` by the server. Uses the client saved by [`Self::connect`].
+    pub async fn cover(&self, item_id: &str, max_width: u32) -> Result<Vec<u8>> {
+        let api = self.api()?;
+        api.image(item_id, "Primary", max_width).await
+    }
+
+    /// Raw bytes of a person's `Primary` image (avatar).
+    pub async fn person_cover(&self, person_id: &str, max_width: u32) -> Result<Vec<u8>> {
+        let api = self.api()?;
+        api.image(person_id, "Primary", max_width).await
+    }
+
     pub fn set_locked(&self, ids: &[String], locked: bool) -> Result<()> {
         let mut inner = self.inner()?;
         inner.store.set_locked(ids, locked)?;
@@ -692,6 +709,7 @@ fn item_view(record: ItemRecord) -> ItemView {
         .effective_people()
         .iter()
         .map(|person| PersonView {
+            id: person.id.clone(),
             name: person.name.clone(),
             role: person.role.clone(),
         })
@@ -726,21 +744,29 @@ fn preset_view(record: PresetRecord) -> Preset {
     }
 }
 
-/// The edit dialog only carries name/role; keep the server-side person id and
-/// type from the matching snapshot entry so write-back preserves them.
+/// The edit dialog carries the person id when it was opened from the grid (the
+/// user may also type new people by hand). Keep the server-side id and type from
+/// the matching snapshot entry so write-back preserves them.
 fn merge_people(existing: &[PersonRecord], edit: Vec<PersonView>) -> Vec<PersonRecord> {
     edit.into_iter()
         .enumerate()
         .map(|(index, person)| {
-            // Prefer the person with the same (normalized) name so deleting an
-            // entry above does not shift ids/types onto the wrong actor.
-            let key = normalize_preset_key(&person.name);
-            let base = existing
-                .iter()
-                .find(|base| normalize_preset_key(&base.name) == key)
+            let id = person.id.clone();
+            // Prefer an explicit id, then the same (normalized) name, then the
+            // positional entry. This survives deleting an entry above without
+            // shifting ids/types onto the wrong actor.
+            let base = id
+                .as_deref()
+                .and_then(|id| existing.iter().find(|base| base.id.as_deref() == Some(id)))
+                .or_else(|| {
+                    let key = normalize_preset_key(&person.name);
+                    existing
+                        .iter()
+                        .find(|base| normalize_preset_key(&base.name) == key)
+                })
                 .or_else(|| existing.get(index));
             PersonRecord {
-                id: base.and_then(|base| base.id.clone()),
+                id: id.or_else(|| base.and_then(|base| base.id.clone())),
                 name: person.name,
                 role: person.role,
                 person_type: base.and_then(|base| base.person_type.clone()),

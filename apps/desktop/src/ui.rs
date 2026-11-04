@@ -251,5 +251,12 @@ pub(crate) fn kv_row(key: impl Into<SharedString>, value: impl IntoElement, them
                 .text_color(muted(theme))
                 .child(key.into()),
         )
-        .child(div().flex_1().min_w_0().text_size(px(12.5)).child(value))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_normal()
+                .text_size(px(12.5))
+                .child(value),
+        )
 }

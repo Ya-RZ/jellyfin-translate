@@ -20,6 +20,7 @@ struct FakeApi {
     updates: Mutex<Vec<(String, Value)>>,
     /// Fields the simulated server refuses to persist (for verification tests).
     ignored_update_fields: Mutex<Vec<String>>,
+    image_calls: Mutex<Vec<(String, String, u32)>>,
 }
 
 impl FakeApi {
@@ -37,6 +38,7 @@ impl FakeApi {
             dtos: Mutex::new(dtos),
             updates: Mutex::new(Vec::new()),
             ignored_update_fields: Mutex::new(Vec::new()),
+            image_calls: Mutex::new(Vec::new()),
         })
     }
 
@@ -49,6 +51,10 @@ impl FakeApi {
 
     fn updates(&self) -> Vec<(String, Value)> {
         self.updates.lock().unwrap().clone()
+    }
+
+    fn image_calls(&self) -> Vec<(String, String, u32)> {
+        self.image_calls.lock().unwrap().clone()
     }
 }
 
@@ -142,6 +148,22 @@ impl JellyfinApi for FakeApi {
                 .unwrap()
                 .push((item_id.to_string(), dto.clone()));
             Ok(())
+        })
+    }
+
+    fn image<'a>(
+        &'a self,
+        item_id: &'a str,
+        image_type: &'a str,
+        max_width: u32,
+    ) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            self.image_calls.lock().unwrap().push((
+                item_id.to_string(),
+                image_type.to_string(),
+                max_width,
+            ));
+            Ok(format!("image:{item_id}:{image_type}:{max_width}").into_bytes())
         })
     }
 }
@@ -370,6 +392,8 @@ async fn sync_pages_through_libraries_and_reports_progress() {
     assert!(!first.locked);
     assert_eq!(first.tags, vec!["Sci-Fi".to_string(), "Heist".to_string()]);
     assert_eq!(first.people.len(), 2);
+    assert_eq!(first.people[0].id.as_deref(), Some("p1"));
+    assert_eq!(first.people[1].id.as_deref(), Some("p2"));
 }
 
 #[tokio::test]
@@ -402,6 +426,7 @@ async fn translate_stores_drafts_uses_presets_and_skips_locked() {
         item.tags,
         vec!["[zh-CN] Sci-Fi".to_string(), "[zh-CN] Heist".to_string()]
     );
+    assert_eq!(item.people[0].id.as_deref(), Some("p1"));
     assert_eq!(item.people[0].name, "莱昂纳多·迪卡普里奥");
     assert_eq!(item.people[0].role.as_deref(), Some("[zh-CN] Dom Cobb"));
     assert_eq!(item.people[1].name, "[zh-CN] Tom Hanks");
@@ -481,6 +506,7 @@ async fn save_draft_downgrades_written_to_draft_and_rejects_locked() {
                 overview: "简介".into(),
                 tags: vec!["科幻".into()],
                 people: vec![PersonView {
+                    id: None,
                     name: "莱昂纳多".into(),
                     role: Some("科布".into()),
                 }],
@@ -528,10 +554,12 @@ async fn write_back_updates_metadata_only_and_locks_fields() {
                 tags: vec!["科幻".into(), "犯罪".into()],
                 people: vec![
                     PersonView {
+                        id: Some("p1".into()),
                         name: "莱昂纳多".into(),
                         role: Some("科布".into()),
                     },
                     PersonView {
+                        id: Some("p2".into()),
                         name: "汤姆·汉克斯".into(),
                         role: Some("旁白".into()),
                     },
@@ -639,4 +667,54 @@ async fn presets_crud_roundtrip() {
 
     service.delete_preset(" TOM HANKS").unwrap();
     assert!(service.presets().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cover_fetches_primary_images_from_the_connected_client() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    let service = synced_service(&fake).await;
+
+    let poster = service.cover("m1", 320).await.unwrap();
+    assert_eq!(poster, b"image:m1:Primary:320");
+    let avatar = service.person_cover("p1", 96).await.unwrap();
+    assert_eq!(avatar, b"image:p1:Primary:96");
+
+    assert_eq!(
+        fake.image_calls(),
+        vec![
+            ("m1".to_string(), "Primary".to_string(), 320),
+            ("p1".to_string(), "Primary".to_string(), 96),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn images_require_a_connection() {
+    let service = AppService::open_in_memory().unwrap();
+    for error in [
+        service.cover("m1", 100).await.unwrap_err().to_string(),
+        service
+            .person_cover("p1", 100)
+            .await
+            .unwrap_err()
+            .to_string(),
+    ] {
+        assert!(
+            error.contains("尚未连接 Jellyfin 服务器"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn person_view_id_is_optional_for_backwards_compatible_json() {
+    let view: PersonView = serde_json::from_str(r#"{"name":"Actor","role":null}"#).unwrap();
+    assert!(view.id.is_none());
+    assert_eq!(view.name, "Actor");
+
+    let json = serde_json::to_value(&view).unwrap();
+    assert_eq!(json["id"], Value::Null);
 }

@@ -20,6 +20,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::covers;
 use crate::ui;
 use crate::views::{connect, library, presets, settings, tasks};
 
@@ -65,6 +66,14 @@ enum SyncEvent {
     Failed(String),
 }
 
+/// A blocking, centred error message (used when an action fails while a
+/// drawer/modal is open, where a toast would be too easy to miss).
+#[derive(Clone)]
+pub(crate) struct ErrorDialog {
+    pub(crate) title: SharedString,
+    pub(crate) detail: SharedString,
+}
+
 /// Root entity: page routing, the shared service handle, page state and the
 /// transient drawer/modal/toast overlays.
 pub(crate) struct AppState {
@@ -81,6 +90,9 @@ pub(crate) struct AppState {
     pub(crate) tasks: tasks::TasksState,
     pub(crate) connect: connect::ConnectState,
     pub(crate) sync: SyncState,
+    pub(crate) error_dialog: Option<ErrorDialog>,
+    pub(crate) covers: covers::CoverCache,
+    pub(crate) cover_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -110,6 +122,9 @@ impl AppState {
             tasks: tasks::TasksState::default(),
             connect: connect::ConnectState::new(window, cx),
             sync: SyncState::default(),
+            error_dialog: None,
+            covers: covers::CoverCache::new(),
+            cover_permits: Arc::new(tokio::sync::Semaphore::new(6)),
         }
     }
 
@@ -309,6 +324,21 @@ impl AppState {
         .detach();
     }
 
+    /// Show a centred Chinese error dialog. The caller does not close any open
+    /// drawer/modal: the user dismisses the dialog explicitly.
+    pub(crate) fn show_error(
+        &mut self,
+        title: impl Into<SharedString>,
+        detail: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.error_dialog = Some(ErrorDialog {
+            title: title.into(),
+            detail: detail.into(),
+        });
+        cx.notify();
+    }
+
     /// Record the outcome of a translate/write/connect job for 任务中心.
     pub(crate) fn record_task(
         &mut self,
@@ -387,6 +417,7 @@ impl AppState {
                                 this.notify_toast(message, cx);
                                 // The mirror changed underneath us: drop the
                                 // cached view before re-reading libraries.
+                                this.covers.clear();
                                 this.library.items.clear();
                                 this.library.selected.clear();
                                 this.library.drawer = None;
@@ -778,19 +809,92 @@ impl AppState {
                 .into_any_element()
         } else {
             v_flex()
-                .gap(px(4.))
+                .gap(px(6.))
                 .children(item.people.iter().map(|person| {
-                    let name = person.name.clone();
-                    let text = match person.role.as_ref() {
-                        Some(role) if !role.is_empty() => format!("{name} · {role}"),
-                        _ => name,
-                    };
-                    div()
-                        .text_size(px(12.5))
-                        .text_color(theme.foreground)
-                        .child(text)
+                    let avatar: AnyElement = person
+                        .id
+                        .as_deref()
+                        .and_then(|person_id| {
+                            self.covers
+                                .image(&covers::person_key(person_id, covers::PERSON_WIDTH))
+                        })
+                        .map(|image| {
+                            img(image)
+                                .size(px(32.))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .object_fit(ObjectFit::Cover)
+                                .into_any_element()
+                        })
+                        .unwrap_or_else(|| {
+                            let initial = person
+                                .name
+                                .chars()
+                                .next()
+                                .map(|ch| ch.to_string())
+                                .unwrap_or_default();
+                            div()
+                                .size(px(32.))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(ui::brand_background())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(12.))
+                                .font_semibold()
+                                .text_color(hsla(0.0, 0.0, 1.0, 1.0))
+                                .child(initial)
+                                .into_any_element()
+                        });
+
+                    h_flex().gap_2().items_center().child(avatar).child(
+                        v_flex()
+                            .min_w_0()
+                            .gap(px(1.))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(theme.foreground)
+                                    .whitespace_normal()
+                                    .child(person.name.clone()),
+                            )
+                            .when_some(person.role.clone(), |column, role| {
+                                column.child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(ui::muted(theme))
+                                        .whitespace_normal()
+                                        .child(role),
+                                )
+                            }),
+                    )
                 }))
                 .into_any_element()
+        };
+
+        let drawer_cover = self
+            .covers
+            .image(&covers::item_key(&item.id, covers::DRAWER_WIDTH))
+            .or_else(|| {
+                self.covers
+                    .image(&covers::item_key(&item.id, covers::POSTER_WIDTH))
+            });
+        let header_art: AnyElement = match drawer_cover {
+            Some(image) => img(image)
+                .w(px(72.))
+                .h(px(104.))
+                .flex_shrink_0()
+                .rounded(px(8.))
+                .object_fit(ObjectFit::Cover)
+                .into_any_element(),
+            None => div()
+                .w(px(72.))
+                .h(px(104.))
+                .flex_shrink_0()
+                .rounded(px(8.))
+                .bg(ui::poster_background(&item.id))
+                .into_any_element(),
         };
 
         let id_edit = item_id.clone();
@@ -801,6 +905,8 @@ impl AppState {
         let lock_label = if locked { "解锁" } else { "锁定" };
 
         h_flex()
+            .id("drawer-panel")
+            .occlude()
             .absolute()
             .top_0()
             .right_0()
@@ -817,14 +923,7 @@ impl AppState {
                     .p(px(16.))
                     .border_b_1()
                     .border_color(ui::border(theme))
-                    .child(
-                        div()
-                            .w(px(72.))
-                            .h(px(104.))
-                            .flex_shrink_0()
-                            .rounded(px(8.))
-                            .bg(ui::poster_background(&item.id)),
-                    )
+                    .child(header_art)
                     .child(
                         v_flex()
                             .flex_1()
@@ -878,12 +977,18 @@ impl AppState {
                     )
                     .child(ui::kv_row(
                         "标题",
-                        item.title.clone().into_any_element(),
+                        div()
+                            .whitespace_normal()
+                            .child(item.title.clone())
+                            .into_any_element(),
                         theme,
                     ))
                     .child(ui::kv_row(
                         "原名",
-                        item.original_title.clone().into_any_element(),
+                        div()
+                            .whitespace_normal()
+                            .child(item.original_title.clone())
+                            .into_any_element(),
                         theme,
                     ))
                     .child(ui::kv_row(
@@ -976,6 +1081,8 @@ impl AppState {
             .justify_center()
             .child(
                 v_flex()
+                    .id("edit-dialog")
+                    .occlude()
                     .w(px(680.))
                     .max_h(px(680.))
                     .rounded(px(14.))
@@ -1134,6 +1241,122 @@ impl AppState {
             .into_any_element()
     }
 
+    fn render_error_dialog(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(dialog) = self.error_dialog.as_ref() else {
+            return div().into_any_element();
+        };
+        let detail = if dialog.detail.trim().is_empty() {
+            "未知错误".to_string()
+        } else {
+            dialog.detail.to_string()
+        };
+
+        let overlay = div()
+            .id("error-overlay")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(hsla(0.0, 0.0, 0.0, 0.55))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.error_dialog = None;
+                cx.notify();
+            }));
+
+        let close = cx.listener(|this, _, _, cx| {
+            this.error_dialog = None;
+            cx.notify();
+        });
+
+        let card = v_flex()
+            .id("error-dialog")
+            .occlude()
+            .w(px(520.))
+            .max_h(px(560.))
+            .rounded(px(14.))
+            .border_1()
+            .border_color(ui::border(theme))
+            .bg(theme.sidebar)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .w_full()
+                    .px(px(18.))
+                    .py(px(14.))
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(ui::border(theme))
+                    .child(div().size(px(8.)).rounded_full().bg(ui::red(theme)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(15.))
+                            .font_semibold()
+                            .child(dialog.title.clone()),
+                    )
+                    .child(
+                        Button::new("error-close-x")
+                            .ghost()
+                            .compact()
+                            .label("✕")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.error_dialog = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("error-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p(px(18.))
+                    .child(
+                        div()
+                            .whitespace_normal()
+                            .text_size(px(12.5))
+                            .text_color(theme.foreground)
+                            .child(detail),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap(px(8.))
+                    .px(px(18.))
+                    .py(px(14.))
+                    .border_t_1()
+                    .border_color(ui::border(theme))
+                    .child(
+                        Button::new("error-close")
+                            .ghost()
+                            .label("关闭")
+                            .on_click(close),
+                    )
+                    .child(
+                        Button::new("error-goto-settings")
+                            .primary()
+                            .label("去设置配置翻译服务")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.error_dialog = None;
+                                this.library.drawer = None;
+                                this.navigate_external(Page::Settings, window, cx);
+                            })),
+                    ),
+            );
+
+        v_flex()
+            .absolute()
+            .inset_0()
+            .items_center()
+            .justify_center()
+            .child(overlay)
+            .child(card)
+            .into_any_element()
+    }
+
     fn render_toast(&self, theme: &Theme) -> impl IntoElement {
         h_flex()
             .absolute()
@@ -1220,6 +1443,10 @@ impl Render for AppState {
 
         if self.library.editing.is_some() {
             root = root.child(self.render_edit_modal(&theme, cx));
+        }
+
+        if self.error_dialog.is_some() {
+            root = root.child(self.render_error_dialog(&theme, cx));
         }
 
         if self.toast.is_some() {

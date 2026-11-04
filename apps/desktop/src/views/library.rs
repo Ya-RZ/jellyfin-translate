@@ -1,6 +1,7 @@
 //! 媒体库页：媒体库 tab、海报网格、多选工具栏与详情抽屉。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use ::core::{ItemEdit, ItemView, LibraryView, PersonView, TranslationStatus};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -11,6 +12,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{AppState, Page};
+use crate::covers;
 use crate::ui;
 
 /// Status filter chips above the poster grid.
@@ -233,7 +235,11 @@ impl AppState {
                 this.library.loading_items = false;
                 match result {
                     Ok(items) => {
+                        let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
                         this.library.items.insert(id_for_result, items);
+                        for item_id in item_ids {
+                            this.request_item_cover(&item_id, covers::POSTER_WIDTH, cx);
+                        }
                     }
                     Err(message) => this.library.error = Some(message.into()),
                 }
@@ -273,7 +279,15 @@ impl AppState {
             }
             cx.notify();
         } else {
-            self.library.drawer = Some(id);
+            self.library.drawer = Some(id.clone());
+            self.request_item_cover(&id, covers::DRAWER_WIDTH, cx);
+            if let Some(item) = self.library.item_by_id(&id).cloned() {
+                for person in item.people {
+                    if let Some(person_id) = person.id.as_deref() {
+                        self.request_person_cover(person_id, covers::PERSON_WIDTH, cx);
+                    }
+                }
+            }
             cx.notify();
         }
     }
@@ -374,6 +388,7 @@ impl AppState {
                     return None;
                 }
                 Some(PersonView {
+                    id: None,
                     name: name.to_string(),
                     role: if role.is_empty() {
                         None
@@ -493,7 +508,9 @@ impl AppState {
                 }
                 Err(message) => {
                     this.record_task("翻译", message.clone(), false, cx);
-                    this.notify_toast(message, cx);
+                    // Keep the drawer open: the user should see the dialog on
+                    // top of it and be able to jump straight to settings.
+                    this.show_error("翻译失败", message, cx);
                 }
             },
         );
@@ -542,7 +559,7 @@ impl AppState {
                 }
                 Err(message) => {
                     this.record_task("写回", message.clone(), false, cx);
-                    this.notify_toast(message, cx);
+                    this.show_error("写回失败", message, cx);
                 }
             },
         );
@@ -919,7 +936,10 @@ impl AppState {
                 .pb(px(40.))
                 .children(visible.into_iter().map(|item| {
                     let selected = self.library.selected.contains(&item.id);
-                    render_poster(item, selected, self.library.multi, theme, cx)
+                    let cover = self
+                        .covers
+                        .image(&covers::item_key(&item.id, covers::POSTER_WIDTH));
+                    render_poster(item, selected, self.library.multi, cover, theme, cx)
                 }))
                 .into_any_element()
         };
@@ -953,6 +973,7 @@ fn render_poster(
     item: &ItemView,
     selected: bool,
     multi: bool,
+    cover: Option<Arc<Image>>,
     theme: &Theme,
     cx: &mut Context<AppState>,
 ) -> AnyElement {
@@ -965,19 +986,35 @@ fn render_poster(
     };
 
     let mut art = v_flex()
+        .relative()
         .w_full()
         .h(px(222.))
         .p(px(12.))
         .justify_end()
-        .bg(ui::poster_background(&item.id))
-        .child(
-            div()
-                .text_size(px(14.))
-                .font_semibold()
-                .line_clamp(3)
-                .text_color(hsla(0.0, 0.0, 1.0, 0.92))
-                .child(title.clone()),
+        .bg(ui::poster_background(&item.id));
+
+    if let Some(image) = cover {
+        art = art.child(
+            img(image)
+                .absolute()
+                .inset_0()
+                .size_full()
+                .object_fit(ObjectFit::Cover),
         );
+    }
+
+    art = art.child(
+        div()
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(5.))
+            .bg(hsla(0.0, 0.0, 0.0, 0.45))
+            .text_size(px(14.))
+            .font_semibold()
+            .line_clamp(3)
+            .text_color(hsla(0.0, 0.0, 1.0, 0.92))
+            .child(title.clone()),
+    );
 
     if multi {
         art = art.child(
