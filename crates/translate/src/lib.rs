@@ -54,32 +54,24 @@ pub trait Translator: Send + Sync {
     async fn translate(&self, request: TranslateRequest) -> Result<TranslateResponse>;
 }
 
-pub mod baidu;
-pub mod deepl;
 pub mod mock;
 pub mod openai;
 
-pub use baidu::BaiduTranslator;
-pub use deepl::DeepLTranslator;
 pub use mock::MockTranslator;
 pub use openai::OpenAiTranslator;
 
 /// Configuration for one provider, as stored by the GUI (secrets come from the
 /// OS keychain and are injected at construction time).
+///
+/// Only the OpenAI-compatible provider ships for now; adding another backend
+/// is a new variant plus a `Translator` implementation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderConfig {
-    Baidu {
-        appid: String,
-        secret: String,
-    },
     OpenAi {
         base_url: String,
         api_key: String,
         model: String,
-    },
-    DeepL {
-        api_key: String,
     },
     Mock,
 }
@@ -87,15 +79,11 @@ pub enum ProviderConfig {
 impl ProviderConfig {
     pub fn build(self) -> Result<Box<dyn Translator>> {
         Ok(match self {
-            ProviderConfig::Baidu { appid, secret } => {
-                Box::new(BaiduTranslator::new(appid, secret)?)
-            }
             ProviderConfig::OpenAi {
                 base_url,
                 api_key,
                 model,
             } => Box::new(OpenAiTranslator::new(base_url, api_key, model)?),
-            ProviderConfig::DeepL { api_key } => Box::new(DeepLTranslator::new(api_key)?),
             ProviderConfig::Mock => Box::new(MockTranslator::default()),
         })
     }

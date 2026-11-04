@@ -13,3 +13,7 @@ serde_json.workspace = true
 store = { path = "../store" }
 tokio.workspace = true
 tracing.workspace = true
+translate = { path = "../translate" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

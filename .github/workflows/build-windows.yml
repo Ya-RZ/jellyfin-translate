@@ -1,11 +1,15 @@
-name: build-windows
+name: build-release
 
 on:
   push:
-  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,9 +23,20 @@ jobs:
       - name: Build desktop app
         run: cargo build --release -p desktop
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Package (exe + zip)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/desktop.exe dist/JellyfinTranslate.exe
+          Copy-Item README.md dist/README.md
+          Compress-Archive -Path dist/JellyfinTranslate.exe, dist/README.md `
+            -DestinationPath dist/JellyfinTranslate-windows-x64.zip -Force
+
+      - name: Publish pre-release
+        uses: softprops/action-gh-release@v2
         with:
-          name: jellyfin-translate-windows
-          path: target/release/desktop.exe
-          if-no-files-found: error
+          tag_name: v0.1.0-pre
+          name: v0.1.0-pre (Windows x64)
+          prerelease: true
+          generate_release_notes: true
+          files: dist/JellyfinTranslate-windows-x64.zip

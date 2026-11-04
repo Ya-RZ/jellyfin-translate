@@ -1,9 +1,17 @@
 //! Jellyfin Translate desktop app (Windows).
 //!
-//! Entry point: builds the tokio runtime used for background work, then opens
-//! the GPUI window with [`app::AppState`] as its root view.
+//! Entry point: builds the tokio runtime used for background work, applies the
+//! UI/UX v2 theme, then opens the GPUI window with [`app::AppState`] as its
+//! root view.
+
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 mod app;
+mod ui;
+mod views;
 
 use app::AppState;
 use gpui_kit::*;
@@ -22,6 +30,7 @@ fn main() {
     let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     application.run(move |cx| {
         gpui_kit::init(cx);
+        ui::apply_theme(cx);
         gpui_kit::open_window(
             WindowOptions {
                 titlebar: Some(TitlebarOptions {
@@ -30,7 +39,7 @@ fn main() {
                 }),
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
-                    size(px(860.), px(640.)),
+                    size(px(1280.), px(820.)),
                     cx,
                 ))),
                 ..Default::default()
@@ -41,6 +50,6 @@ fn main() {
         .expect("failed to open the main window");
     });
 
-    // Don't wait for an in-flight sync when the window closes.
+    // Don't wait for in-flight jobs when the window closes.
     runtime.shutdown_background();
 }

@@ -19,11 +19,19 @@
 
 ```text
 apps/desktop      gpui-kit 桌面应用（唯一二进制）
-crates/core       服务编排：同步、写回、锁定
+crates/core       服务编排：同步、翻译、写回、锁定
 crates/jellyfin   Jellyfin 12.x REST 客户端
-crates/store      SQLite 本地镜像与译文
-crates/translate  翻译 provider（百度 / OpenAI 兼容 / DeepL / Mock）
+crates/store      SQLite 本地镜像、译文、演员预设
+crates/translate  翻译 provider trait + OpenAI 兼容实现（后续可扩展）
 ```
+
+## 界面
+
+- 媒体库：多库 tab 切换、海报网格、多选、状态徽标（未翻译/草稿/已写回/已锁定）
+- 详情：右侧抽屉；编辑弹窗；单条翻译/写回/锁定
+- 演员预设：演员姓名完全匹配时使用预设译名
+- 设置：OpenAI 兼容接口、按字段的提示词模板、语言、并发
+- 数据目录：程序目录下的 `data\`（便携，可整目录拷走）
 
 ## 构建
 
@@ -53,6 +61,12 @@ API Key 在 Jellyfin 控制台 → 管理 → API 密钥创建，写元数据与
 2. 只修改目标字段，其余原样保留；
 3. 整份 `POST` 回去；
 4. 写入的字段加入 `LockedFields`，防止重新刮削覆盖。
+
+应用内还有视频级锁定：锁定后不再参与翻译/写回，解锁后才能重译。
+
+## 发布
+
+推送到 `main` 后，GitHub Actions 在 Windows 上构建，并把 `JellyfinTranslate-windows-x64.zip` 上传到固定 tag `v0.1.0-pre` 的 **pre-release**（不使用 Actions artifact）。
 
 ## License
 

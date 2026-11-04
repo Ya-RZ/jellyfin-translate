@@ -72,8 +72,7 @@ impl OpenAiTranslator {
     async fn translate_once(
         &self,
         segments: &[&Segment],
-        source_lang: &str,
-        target_lang: &str,
+        system_content: &str,
     ) -> Result<(Vec<String>, Option<u64>)> {
         let payload_segments = segments
             .iter()
@@ -81,9 +80,6 @@ impl OpenAiTranslator {
             .collect::<Vec<_>>();
         let user_content = serde_json::to_string(&payload_segments)
             .context("openai: failed to serialize segments")?;
-        let system_content = format!(
-            "{SYSTEM_PROMPT}\nSource language: {source_lang}\nTarget language: {target_lang}"
-        );
 
         let body = json!({
             "model": self.model,
@@ -200,6 +196,21 @@ impl Translator for OpenAiTranslator {
     }
 
     async fn translate(&self, request: TranslateRequest) -> Result<TranslateResponse> {
+        self.translate_with_prompt(request, None).await
+    }
+}
+
+impl OpenAiTranslator {
+    /// Translate with extra field-specific instructions (e.g. a per-field prompt
+    /// template from the app settings).
+    ///
+    /// `instructions` is prepended to the fixed system prompt; the JSON segment
+    /// contract stays last so the model always returns parsable segment JSON.
+    pub async fn translate_with_prompt(
+        &self,
+        request: TranslateRequest,
+        instructions: Option<&str>,
+    ) -> Result<TranslateResponse> {
         if request.segments.is_empty() {
             return Ok(TranslateResponse {
                 segments: Vec::new(),
@@ -223,6 +234,7 @@ impl Translator for OpenAiTranslator {
             request.source_lang.trim()
         };
 
+        let system_content = build_system_prompt(source_lang, target_lang, instructions);
         let mut translated: Vec<Option<String>> = vec![None; request.segments.len()];
         for (index, segment) in request.segments.iter().enumerate() {
             if segment.text.is_empty() {
@@ -240,10 +252,7 @@ impl Translator for OpenAiTranslator {
             let mut last_error: Option<anyhow::Error> = None;
             let mut outcome: Option<(Vec<String>, Option<u64>)> = None;
             for attempt in 0..MAX_ATTEMPTS {
-                match self
-                    .translate_once(&batch_segments, source_lang, target_lang)
-                    .await
-                {
+                match self.translate_once(&batch_segments, &system_content).await {
                     Ok(value) => {
                         outcome = Some(value);
                         break;
@@ -291,6 +300,28 @@ impl Translator for OpenAiTranslator {
             },
         })
     }
+}
+
+/// Field-specific instructions come first, the machine-readable segment
+/// contract last (a prompt template that says "only output the translation"
+/// must not override the JSON contract).
+fn build_system_prompt(source_lang: &str, target_lang: &str, instructions: Option<&str>) -> String {
+    let mut prompt = String::new();
+    if let Some(extra) = instructions {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            prompt.push_str(extra);
+            prompt.push_str(
+                "\n\nRegardless of the wording above, always answer with the JSON object \
+                 described below.\n\n",
+            );
+        }
+    }
+    prompt.push_str(SYSTEM_PROMPT);
+    prompt.push_str(&format!(
+        "\nSource language: {source_lang}\nTarget language: {target_lang}"
+    ));
+    prompt
 }
 
 /// Splits segment indices into requests of at most [`MAX_BATCH_CHARS`] characters.
@@ -534,5 +565,43 @@ mod tests {
         mock.assert_hits(2);
         assert!(error.contains("openai"), "unexpected error: {error}");
         assert!(error.contains("segment JSON"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn prepends_field_instructions_to_the_system_prompt() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("FIELD-INSTRUCTION: translate titles")
+                .body_contains("translation engine");
+            then.status(200).json_body(json!({
+                "choices": [{
+                    "message": {
+                        "content": "{\"segments\":[{\"id\":\"s1\",\"text\":\"你好\"}]}"
+                    }
+                }]
+            }));
+        });
+
+        let translator = OpenAiTranslator::new(
+            format!("{}/v1", server.base_url()),
+            "test-key".to_owned(),
+            "test-model".to_owned(),
+        )
+        .unwrap();
+        let response = translator
+            .translate_with_prompt(
+                request(vec![Segment {
+                    id: "s1".to_owned(),
+                    text: "Hello".to_owned(),
+                }]),
+                Some("FIELD-INSTRUCTION: translate titles"),
+            )
+            .await
+            .unwrap();
+
+        mock.assert_hits(1);
+        assert_eq!(response.segments[0].text, "你好");
     }
 }

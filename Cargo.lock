@@ -1085,6 +1085,7 @@ dependencies = [
  "store",
  "tokio",
  "tracing",
+ "translate",
 ]
 
 [[package]]
@@ -7139,7 +7140,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "httpmock",
- "md-5",
  "reqwest",
  "serde",
  "serde_json",
