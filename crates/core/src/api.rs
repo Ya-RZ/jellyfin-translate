@@ -14,12 +14,13 @@ use std::pin::Pin;
 use anyhow::Result;
 use serde_json::Value;
 
-use jellyfin::{ItemsPage, Library};
+use jellyfin::{ItemsPage, Library, SystemInfo};
 use translate::{TranslateRequest, TranslateResponse};
 
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub(crate) trait JellyfinApi: Send + Sync {
+    fn system_info<'a>(&'a self) -> BoxFuture<'a, Result<SystemInfo>>;
     fn libraries<'a>(&'a self) -> BoxFuture<'a, Result<Vec<Library>>>;
     fn items_page<'a>(
         &'a self,
@@ -39,6 +40,10 @@ pub(crate) trait JellyfinApi: Send + Sync {
 }
 
 impl JellyfinApi for jellyfin::Client {
+    fn system_info<'a>(&'a self) -> BoxFuture<'a, Result<SystemInfo>> {
+        Box::pin(jellyfin::Client::system_info(self))
+    }
+
     fn libraries<'a>(&'a self) -> BoxFuture<'a, Result<Vec<Library>>> {
         Box::pin(jellyfin::Client::libraries(self))
     }

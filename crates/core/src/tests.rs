@@ -79,6 +79,16 @@ fn dto_json(item: &jellyfin::ItemDto) -> Value {
 }
 
 impl JellyfinApi for FakeApi {
+    fn system_info<'a>(&'a self) -> BoxFuture<'a, Result<ServerInfo>> {
+        Box::pin(async move {
+            Ok(ServerInfo {
+                id: "server".into(),
+                server_name: "media.home".into(),
+                version: "12.0.0".into(),
+            })
+        })
+    }
+
     fn libraries<'a>(&'a self) -> BoxFuture<'a, Result<Vec<jellyfin::Library>>> {
         Box::pin(async move { Ok(self.libraries.clone()) })
     }
@@ -265,6 +275,17 @@ fn templates() -> Templates {
     }
 }
 
+fn temp_data_dir(label: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "jellyfin-translate-core-test-{label}-{}-{nanos}",
+        std::process::id()
+    ))
+}
+
 async fn synced_service(fake: &Arc<FakeApi>) -> AppService {
     let service = AppService::open_in_memory().unwrap();
     service.install_api(fake.clone()).unwrap();
@@ -284,14 +305,7 @@ fn service_is_send_and_sync() {
 
 #[test]
 fn open_creates_database_and_seeds_settings() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "jellyfin-translate-core-test-{}-{nanos}",
-        std::process::id()
-    ));
+    let dir = temp_data_dir("open");
 
     let service = AppService::open_at(&dir).unwrap();
     assert_eq!(service.data_dir_path(), dir);
@@ -717,4 +731,121 @@ fn person_view_id_is_optional_for_backwards_compatible_json() {
 
     let json = serde_json::to_value(&view).unwrap();
     assert_eq!(json["id"], Value::Null);
+}
+
+#[test]
+fn jellyfin_config_roundtrip_uses_atomic_write() {
+    let dir = temp_data_dir("config-roundtrip");
+    let service = AppService::open_at(&dir).unwrap();
+
+    let config = JellyfinConfig {
+        url: "http://media.home:8096".into(),
+        api_key: "secret".into(),
+    };
+    service.save_jellyfin_config(&config).unwrap();
+    assert_eq!(service.jellyfin_config().unwrap(), config);
+    assert_eq!(service.config_path(), dir.join("config.json"));
+
+    // Saving again replaces the file atomically.
+    let replaced = JellyfinConfig {
+        url: "https://other.example".into(),
+        api_key: "key-2".into(),
+    };
+    service.save_jellyfin_config(&replaced).unwrap();
+    assert_eq!(service.jellyfin_config().unwrap(), replaced);
+
+    let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    let json: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(json["jellyfin"]["url"], "https://other.example");
+    assert_eq!(json["jellyfin"]["api_key"], "key-2");
+
+    // The temp file was renamed, not left behind.
+    let leftovers = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp"))
+        .collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.join("config.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    drop(service);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn jellyfin_config_defaults_when_missing_or_corrupt() {
+    let dir = temp_data_dir("config-default");
+    let service = AppService::open_at(&dir).unwrap();
+
+    // Missing file.
+    assert_eq!(
+        service.jellyfin_config().unwrap(),
+        JellyfinConfig::default()
+    );
+
+    // Invalid JSON.
+    std::fs::write(dir.join("config.json"), b"{ this is not json").unwrap();
+    assert_eq!(
+        service.jellyfin_config().unwrap(),
+        JellyfinConfig::default()
+    );
+
+    // Partially populated JSON keeps what is there, defaults the rest.
+    std::fs::write(
+        dir.join("config.json"),
+        br#"{"jellyfin":{"url":"http://media.home:8096"}}"#,
+    )
+    .unwrap();
+    let config = service.jellyfin_config().unwrap();
+    assert_eq!(config.url, "http://media.home:8096");
+    assert!(config.api_key.is_empty());
+
+    drop(service);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn connect_persists_credentials_after_success() {
+    let dir = temp_data_dir("connect-persist");
+    let service = AppService::open_at(&dir).unwrap();
+
+    let fake = FakeApi::new(vec![], vec![]);
+    service
+        .install_client_factory(Arc::new(move |_url, _key| {
+            Ok(fake.clone() as Arc<dyn JellyfinApi>)
+        }))
+        .unwrap();
+
+    let info = service
+        .connect("  http://media.home:8096  ", " secret ")
+        .await
+        .unwrap();
+    assert_eq!(info.server_name, "media.home");
+
+    let config = service.jellyfin_config().unwrap();
+    assert_eq!(config.url, "http://media.home:8096");
+    assert_eq!(config.api_key, "secret");
+
+    // The connected fake client was installed and is usable immediately.
+    let bytes = service.cover("m1", 64).await.unwrap();
+    assert_eq!(bytes, b"image:m1:Primary:64");
+
+    let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    let json: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(json["jellyfin"]["url"], "http://media.home:8096");
+    assert_eq!(json["jellyfin"]["api_key"], "secret");
+
+    drop(service);
+    std::fs::remove_dir_all(&dir).ok();
 }

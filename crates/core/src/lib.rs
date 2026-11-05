@@ -8,9 +8,10 @@
 //! `.await`.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,24 @@ pub struct Preset {
     pub uses: i64,
 }
 
+/// Persisted Jellyfin connection settings (`<data dir>/config.json`).
+///
+/// Stored so the desktop app can pre-fill the connection form and reconnect on
+/// startup. The API key is a local secret; the file is written with `0600`
+/// permissions on Unix.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JellyfinConfig {
+    pub url: String,
+    pub api_key: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    jellyfin: JellyfinConfig,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SyncProgress {
     pub libraries_done: usize,
@@ -152,11 +171,17 @@ pub struct WriteReport {
     pub failed: Vec<(String, String)>,
 }
 
+#[cfg(test)]
+type ClientFactory = dyn Fn(&str, &str) -> Result<Arc<dyn JellyfinApi>> + Send + Sync;
+
 struct Inner {
     store: Store,
     api: Option<Arc<dyn JellyfinApi>>,
     #[cfg(test)]
     translator: Option<Arc<dyn PromptTranslator>>,
+    /// Lets tests exercise `connect` without a real server.
+    #[cfg(test)]
+    client_factory: Option<Arc<ClientFactory>>,
 }
 
 pub struct AppService {
@@ -195,6 +220,8 @@ impl AppService {
                 api: None,
                 #[cfg(test)]
                 translator: None,
+                #[cfg(test)]
+                client_factory: None,
             })),
         };
         service.seed_defaults()?;
@@ -210,6 +237,8 @@ impl AppService {
                 api: None,
                 #[cfg(test)]
                 translator: None,
+                #[cfg(test)]
+                client_factory: None,
             })),
         };
         service.seed_defaults()?;
@@ -253,14 +282,101 @@ impl AppService {
 
     pub async fn connect(&self, url: &str, api_key: &str) -> Result<ServerInfo> {
         // Network round trip first; the mutex is only taken to publish the client.
-        let client = jellyfin::Client::new(url, api_key)?;
-        let info = client.system_info().await?;
+        let api = self.make_api(url, api_key)?;
+        let info = api.system_info().await?;
+
+        // Persist only after the server accepted these credentials. A failed
+        // write must not turn a successful connection into an error.
+        let config = JellyfinConfig {
+            url: url.trim().to_string(),
+            api_key: api_key.trim().to_string(),
+        };
+        if let Err(error) = self.save_jellyfin_config(&config) {
+            tracing::warn!(error = %error, "failed to persist Jellyfin connection settings");
+        }
+
         {
             let mut inner = self.inner()?;
-            inner.api = Some(Arc::new(client));
+            inner.api = Some(api);
         }
         tracing::info!(server = %info.server_name, version = %info.version, "connected to Jellyfin");
         Ok(info)
+    }
+
+    fn make_api(&self, url: &str, api_key: &str) -> Result<Arc<dyn JellyfinApi>> {
+        #[cfg(test)]
+        {
+            if let Some(factory) = self.inner()?.client_factory.clone() {
+                return factory(url, api_key);
+            }
+        }
+        Ok(Arc::new(jellyfin::Client::new(url, api_key)?))
+    }
+
+    /// Path of the persisted connection settings.
+    pub fn config_path(&self) -> PathBuf {
+        self.data_dir.join("config.json")
+    }
+
+    /// Load the persisted Jellyfin connection settings.
+    ///
+    /// A missing file or invalid JSON yields empty defaults instead of an error
+    /// (a fresh/broken config must never block startup). Other I/O errors (for
+    /// example a permission problem) are reported.
+    pub fn jellyfin_config(&self) -> Result<JellyfinConfig> {
+        let path = self.config_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(JellyfinConfig::default());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("读取 {}", path.display()));
+            }
+        };
+        match serde_json::from_slice::<ConfigFile>(&bytes) {
+            Ok(file) => Ok(file.jellyfin),
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "config.json 解析失败，使用默认连接配置"
+                );
+                Ok(JellyfinConfig::default())
+            }
+        }
+    }
+
+    /// Atomically persist the Jellyfin connection settings.
+    ///
+    /// The file is written to a sibling temp file (mode `0600` on Unix) and then
+    /// renamed over `config.json`, so a crash never leaves a half-written file.
+    pub fn save_jellyfin_config(&self, config: &JellyfinConfig) -> Result<()> {
+        let path = self.config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建 {}", parent.display()))?;
+        }
+        let payload = serde_json::to_vec_pretty(&ConfigFile {
+            jellyfin: config.clone(),
+        })
+        .context("序列化 config.json")?;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let tmp = path.with_file_name(format!(".config.json.tmp.{}.{}", std::process::id(), nanos));
+
+        if let Err(error) = write_private_file(&tmp, &payload) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("替换 {}", path.display()));
+        }
+        Ok(())
     }
 
     pub fn libraries(&self) -> Result<Vec<LibraryView>> {
@@ -608,6 +724,13 @@ impl AppService {
     fn install_translator(&self, translator: Arc<dyn PromptTranslator>) -> Result<()> {
         let mut inner = self.inner()?;
         inner.translator = Some(translator);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn install_client_factory(&self, factory: Arc<ClientFactory>) -> Result<()> {
+        let mut inner = self.inner()?;
+        inner.client_factory = Some(factory);
         Ok(())
     }
 }
@@ -1330,6 +1453,25 @@ async fn verify_written(
         "读回校验失败：People 期望 {expected:?}，实际 {actual_people:?}"
     );
 
+    Ok(())
+}
+
+/// Create `path` with private permissions (0600 on Unix) and flush it.
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("创建 {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("写入 {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("同步 {}", path.display()))?;
     Ok(())
 }
 

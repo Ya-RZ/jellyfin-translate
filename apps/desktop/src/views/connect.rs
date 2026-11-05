@@ -20,6 +20,8 @@ pub(crate) struct ConnectState {
     pub(crate) server: Option<ServerDetails>,
     pub(crate) connecting: bool,
     pub(crate) error: Option<SharedString>,
+    /// Whether the saved credentials were already restored this session.
+    pub(crate) restored: bool,
 }
 
 impl ConnectState {
@@ -34,6 +36,7 @@ impl ConnectState {
             server: None,
             connecting: false,
             error: None,
+            restored: false,
         }
     }
 
@@ -50,7 +53,56 @@ impl ConnectState {
 }
 
 impl AppState {
-    fn connect_server(&mut self, window: &Window, cx: &mut Context<Self>) {
+    /// Restore the Jellyfin URL/API key saved by a previous session and, when
+    /// both are present, connect automatically.
+    ///
+    /// Runs on the tokio runtime because it reads the config file. The values
+    /// stay in the inputs even when the automatic connection fails.
+    pub(crate) fn restore_saved_config(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.connect.restored || self.service.is_none() {
+            return;
+        }
+        self.connect.restored = true;
+
+        self.spawn_job_in(
+            window,
+            cx,
+            |service| service.jellyfin_config().map_err(ui::error_text),
+            |this, result, window, cx| {
+                match result {
+                    Ok(config) => {
+                        let url = config.url.trim().to_string();
+                        let api_key = config.api_key.trim().to_string();
+
+                        if !url.is_empty() {
+                            let value = url.clone();
+                            this.connect
+                                .url
+                                .update(cx, |state, cx| state.set_value(value, window, cx));
+                        }
+                        if !api_key.is_empty() {
+                            let value = api_key.clone();
+                            this.connect
+                                .api_key
+                                .update(cx, |state, cx| state.set_value(value, window, cx));
+                        }
+
+                        if !url.is_empty() && !api_key.is_empty() {
+                            this.connect_server(window, cx, true);
+                        }
+                    }
+                    Err(message) => {
+                        // A missing or unreadable config is not fatal: keep the
+                        // page usable so the user can enter credentials.
+                        tracing::debug!(error = %message, "read saved Jellyfin config failed");
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn connect_server(&mut self, window: &Window, cx: &mut Context<Self>, auto: bool) {
         let raw_url = self.connect.url.read(cx).value().to_string();
         let api_key = self.connect.api_key.read(cx).value().trim().to_string();
 
@@ -81,7 +133,7 @@ impl AppState {
                         .map_err(ui::error_text)
                 })
             },
-            |this, result, _window, cx| {
+            move |this, result, _window, cx| {
                 this.connect.connecting = false;
                 match result {
                     Ok(info) => {
@@ -105,8 +157,18 @@ impl AppState {
                     }
                     Err(message) => {
                         this.connect.server = None;
-                        this.connect.error = Some(message.clone().into());
-                        this.record_task("连接", message, false, cx);
+                        let shown = if auto {
+                            format!(
+                                "自动连接失败：无法连接 Jellyfin，请检查地址、API Key 或网络。（{message}）"
+                            )
+                        } else {
+                            format!("连接失败：{message}")
+                        };
+                        this.connect.error = Some(shown.clone().into());
+                        if auto {
+                            this.notify_toast(shown.clone(), cx);
+                        }
+                        this.record_task("连接", shown, false, cx);
                     }
                 }
                 cx.notify();
@@ -145,6 +207,15 @@ impl AppState {
                     ),
             )
             .child(
+                div()
+                    .w_full()
+                    .text_size(px(11.5))
+                    .text_color(ui::muted(theme))
+                    .child(
+                        "连接信息保存在程序目录 data/config.json（地址与 API Key 仅本机保存）。",
+                    ),
+            )
+            .child(
                 Button::new("connect-server")
                     .primary()
                     .w_full()
@@ -155,7 +226,9 @@ impl AppState {
                     })
                     .loading(self.connect.connecting)
                     .disabled(self.connect.connecting)
-                    .on_click(cx.listener(|this, _, window, cx| this.connect_server(window, cx))),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.connect_server(window, cx, false)),
+                    ),
             );
 
         if let Some(server) = self.connect.server.as_ref() {

@@ -151,6 +151,7 @@ impl AppState {
                         this.load_libraries(cx);
                         this.load_settings(window, cx);
                         this.load_presets(cx);
+                        this.restore_saved_config(window, cx);
                     }
                     Some(Err(message)) => this.service_error = Some(message.into()),
                     None => this.service_error = Some("本地数据服务启动失败".into()),
