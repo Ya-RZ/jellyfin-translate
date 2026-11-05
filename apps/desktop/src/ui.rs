@@ -114,6 +114,9 @@ pub(crate) fn apply_theme(cx: &mut App) {
         theme.tab_bar = rgb(0x141821).into();
         theme.switch = rgb(0x1a1f2b).into();
         theme.ring = rgb(0x00a4dc).into();
+        // The app window uses the OS title bar; the sheet should span the
+        // full content height instead of leaving a title-bar-sized gap.
+        theme.sheet.margin_top = px(0.);
     });
 }
 
