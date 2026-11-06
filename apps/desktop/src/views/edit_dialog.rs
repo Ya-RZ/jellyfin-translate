@@ -86,7 +86,17 @@ impl EditSource {
                     self.tags.join(", ")
                 }
             }
-            EditField::People => format_people(&self.people),
+            EditField::People => {
+                if self.people.is_empty() {
+                    "—".to_string()
+                } else {
+                    self.people
+                        .iter()
+                        .map(|person| person.name.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            }
         }
     }
 }
@@ -101,9 +111,9 @@ pub(crate) struct TagRow {
 pub(crate) struct PersonEditRow {
     pub(crate) id: Option<String>,
     pub(crate) source_name: String,
-    pub(crate) source_role: String,
     pub(crate) name: Entity<TextareaState>,
-    pub(crate) role: Entity<TextareaState>,
+    /// Role is not shown or edited anymore, but must survive a save.
+    pub(crate) role: Option<String>,
 }
 
 pub(crate) enum FieldEditorState {
@@ -137,12 +147,11 @@ fn format_people(people: &[PersonView]) -> String {
     if people.is_empty() {
         return "—".to_string();
     }
+    // Roles stay in the data and are preserved on save, but the edit UI only
+    // lists person names now.
     people
         .iter()
-        .map(|person| match person.role.as_ref() {
-            Some(role) if !role.is_empty() => format!("{} / {}", person.name, role),
-            _ => person.name.clone(),
-        })
+        .map(|person| person.name.clone())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -202,23 +211,18 @@ fn build_people_rows(
             let source = item.source.people.get(index);
             let translated = item.people.get(index);
             PersonEditRow {
-                id: source.and_then(|person| person.id.clone()),
+                id: source
+                    .and_then(|person| person.id.clone())
+                    .or_else(|| translated.and_then(|person| person.id.clone())),
                 source_name: source.map(|person| person.name.clone()).unwrap_or_default(),
-                source_role: source
-                    .and_then(|person| person.role.clone())
-                    .unwrap_or_default(),
                 name: new_textarea(
                     translated.map(|person| person.name.as_str()).unwrap_or(""),
                     window,
                     cx,
                 ),
-                role: new_textarea(
-                    translated
-                        .and_then(|person| person.role.as_deref())
-                        .unwrap_or(""),
-                    window,
-                    cx,
-                ),
+                role: translated
+                    .and_then(|person| person.role.clone())
+                    .or_else(|| source.and_then(|person| person.role.clone())),
             }
         })
         .collect()
@@ -355,7 +359,7 @@ impl AppState {
                 h_flex()
                     .w_full()
                     .min_w_0()
-                    .items_start()
+                    .items_center()
                     .gap_3()
                     .px(px(18.))
                     .py(px(14.))
@@ -389,27 +393,15 @@ impl AppState {
                             ),
                     )
                     .child(
-                        h_flex()
-                            .flex_shrink_0()
-                            .gap_2()
-                            .child(
-                                Button::new(format!("edit-field-open-{}", field.label()))
-                                    .small()
-                                    .label("编辑")
-                                    .disabled(busy || locked)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_field_editor(field, window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new(format!("edit-field-write-{}", field.label()))
-                                    .small()
-                                    .label("写回")
-                                    .disabled(busy || locked)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.write_field_back(field, window, cx)
-                                    })),
-                            ),
+                        h_flex().flex_shrink_0().items_center().child(
+                            Button::new(format!("edit-field-open-{}", field.label()))
+                                .small()
+                                .label("编辑")
+                                .disabled(busy || locked)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_field_editor(field, window, cx)
+                                })),
+                        ),
                     ),
             );
         }
@@ -565,17 +557,21 @@ impl AppState {
         }
 
         match editor {
-            FieldEditorState::Text { field: _, input } => {
+            FieldEditorState::Text { field, input } => {
+                let input_height = match field {
+                    EditField::Title | EditField::OriginalTitle => px(60.),
+                    EditField::Overview => px(160.),
+                    _ => px(120.),
+                };
                 body = body.child(
-                    h_flex()
+                    v_flex()
                         .w_full()
                         .min_w_0()
-                        .flex_wrap()
-                        .gap_3()
+                        .gap(px(12.))
                         .child(
                             v_flex()
-                                .flex_1()
-                                .min_w(px(280.))
+                                .w_full()
+                                .min_w_0()
                                 .gap(px(4.))
                                 .child(
                                     div()
@@ -603,8 +599,8 @@ impl AppState {
                         )
                         .child(
                             v_flex()
-                                .flex_1()
-                                .min_w(px(280.))
+                                .w_full()
+                                .min_w_0()
                                 .gap(px(4.))
                                 .child(
                                     div()
@@ -612,7 +608,9 @@ impl AppState {
                                         .text_color(ui::muted(theme))
                                         .child("译文"),
                                 )
-                                .child(Textarea::new(input).h(px(120.)).w_full().disabled(busy)),
+                                .child(
+                                    Textarea::new(input).h(input_height).w_full().disabled(busy),
+                                ),
                         ),
                 );
             }
@@ -663,8 +661,8 @@ impl AppState {
                         .gap_2()
                         .text_size(px(11.5))
                         .text_color(ui::muted(theme))
-                        .child(div().flex_1().min_w_0().child("原文（姓名 / 角色）"))
-                        .child(div().flex_1().min_w_0().child("译文（姓名 / 角色）")),
+                        .child(div().flex_1().min_w_0().child("原文姓名"))
+                        .child(div().flex_1().min_w_0().child("译文姓名")),
                 );
                 body = body.child(v_flex().w_full().min_w_0().gap(px(10.)).children(
                     rows.iter().map(|row| {
@@ -674,52 +672,26 @@ impl AppState {
                             .gap_2()
                             .items_start()
                             .child(
-                                v_flex()
+                                div()
                                     .flex_1()
                                     .min_w_0()
-                                    .gap(px(2.))
+                                    .whitespace_normal()
                                     .p(px(10.))
                                     .rounded(px(8.))
                                     .border_1()
                                     .border_color(ui::border(theme))
                                     .bg(theme.muted)
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .min_w_0()
-                                            .whitespace_normal()
-                                            .text_size(px(12.5))
-                                            .child(if row.source_name.is_empty() {
-                                                "—".to_string()
-                                            } else {
-                                                row.source_name.clone()
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .min_w_0()
-                                            .whitespace_normal()
-                                            .text_size(px(11.5))
-                                            .text_color(ui::muted(theme))
-                                            .child(if row.source_role.is_empty() {
-                                                "（无角色）".to_string()
-                                            } else {
-                                                row.source_role.clone()
-                                            }),
-                                    ),
+                                    .text_size(px(12.5))
+                                    .child(if row.source_name.is_empty() {
+                                        "—".to_string()
+                                    } else {
+                                        row.source_name.clone()
+                                    }),
                             )
                             .child(
-                                v_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap(px(4.))
-                                    .child(
-                                        Textarea::new(&row.name).h(px(40.)).w_full().disabled(busy),
-                                    )
-                                    .child(
-                                        Textarea::new(&row.role).h(px(40.)).w_full().disabled(busy),
-                                    ),
+                                div().flex_1().min_w_0().child(
+                                    Textarea::new(&row.name).h(px(40.)).w_full().disabled(busy),
+                                ),
                             )
                     }),
                 ));
@@ -754,11 +726,19 @@ impl AppState {
                     ),
             )
             .child(
-                Button::new("field-editor-save")
-                    .label("保存")
+                Button::new("field-editor-draft")
+                    .label("草稿")
                     .disabled(busy)
                     .on_click(
                         cx.listener(|this, _, window, cx| this.save_field_editor(window, cx)),
+                    ),
+            )
+            .child(
+                Button::new("field-editor-write")
+                    .label("写回")
+                    .disabled(busy)
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.write_field_editor(window, cx)),
                     ),
             )
             .child(
@@ -1050,28 +1030,14 @@ impl AppState {
         );
     }
 
-    fn save_field_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.library.field_busy || self.library.field_editor.is_none() {
-            return;
-        }
-        if !self.edit_service_ready(cx) {
-            return;
-        }
-        let Some(item) = self.library.editing_item() else {
-            return;
-        };
-        let Some(editor_field) = self
+    /// Copy the nested editor rows back into the canonical draft values.
+    fn materialize_field_editor(&mut self, cx: &Context<Self>) -> Option<EditField> {
+        let field = self
             .library
             .field_editor
             .as_ref()
-            .map(FieldEditorState::field)
-        else {
-            return;
-        };
-        let item_id = item.id.clone();
-        let library_id = item.library_id.clone();
+            .map(FieldEditorState::field)?;
 
-        // Materialise the multi-row editors back into the canonical draft.
         let mut tags = None;
         let mut people = None;
         match &self.library.field_editor {
@@ -1091,11 +1057,12 @@ impl AppState {
                             if name.is_empty() {
                                 return None;
                             }
-                            let role = row.role.read(cx).value().trim().to_string();
+                            // Role is hidden in the new UI; keep the stored
+                            // value instead of clearing it on save.
                             Some(PersonView {
                                 id: row.id.clone(),
                                 name,
-                                role: if role.is_empty() { None } else { Some(role) },
+                                role: row.role.clone(),
                             })
                         })
                         .collect::<Vec<_>>(),
@@ -1109,7 +1076,24 @@ impl AppState {
         if let Some(people) = people {
             self.library.edit_people = people;
         }
+        Some(field)
+    }
 
+    fn save_field_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.library.field_busy || self.library.field_editor.is_none() {
+            return;
+        }
+        if !self.edit_service_ready(cx) {
+            return;
+        }
+        let Some(item) = self.library.editing_item() else {
+            return;
+        };
+        let Some(editor_field) = self.materialize_field_editor(cx) else {
+            return;
+        };
+        let item_id = item.id.clone();
+        let library_id = item.library_id.clone();
         let edit = self.build_edit(cx);
         self.library.field_busy = true;
         self.library.field_error = None;
@@ -1227,10 +1211,13 @@ impl AppState {
         );
     }
 
-    fn write_field_back(&mut self, field: EditField, window: &mut Window, cx: &mut Context<Self>) {
-        if self.library.edit_busy || !self.edit_service_ready(cx) {
+    fn write_field_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.library.field_busy || !self.edit_service_ready(cx) {
             return;
         }
+        let Some(field) = self.materialize_field_editor(cx) else {
+            return;
+        };
         let Some(item) = self.library.editing_item() else {
             return;
         };
@@ -1239,8 +1226,8 @@ impl AppState {
         let edit = self.build_edit(cx);
         let kind = field.kind();
 
-        self.library.edit_busy = true;
-        self.library.edit_error = None;
+        self.library.field_busy = true;
+        self.library.field_error = None;
         cx.notify();
 
         self.spawn_async_job_in(
@@ -1262,7 +1249,7 @@ impl AppState {
                 })
             },
             move |this, result, window, cx| {
-                this.library.edit_busy = false;
+                this.library.field_busy = false;
                 match result {
                     Ok((report, item)) => {
                         if let Some(item) = item {
@@ -1270,19 +1257,19 @@ impl AppState {
                         }
                         if let Some((_, error)) = report.failed.first() {
                             let message = format!("写回失败：{error}");
-                            this.library.edit_error = Some(message.clone().into());
+                            this.library.field_error = Some(message.clone().into());
                             this.notify_toast(message, cx);
                         } else if report.written == 0 {
                             let message = "写回未成功：条目可能已锁定".to_string();
-                            this.library.edit_error = Some(message.clone().into());
+                            this.library.field_error = Some(message.clone().into());
                             this.notify_toast(message, cx);
                         } else {
-                            this.notify_toast(format!("已写回字段：{}", field.label()), cx);
+                            this.notify_toast("已写回", cx);
                         }
                     }
                     Err(message) => {
                         let message = format!("写回失败：{message}");
-                        this.library.edit_error = Some(message.clone().into());
+                        this.library.field_error = Some(message.clone().into());
                         this.notify_toast(message, cx);
                     }
                 }
