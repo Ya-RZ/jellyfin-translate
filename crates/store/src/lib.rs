@@ -197,7 +197,8 @@ impl Store {
                 id              TEXT PRIMARY KEY,
                 name            TEXT NOT NULL,
                 collection_type TEXT,
-                synced_at       INTEGER NOT NULL DEFAULT 0
+                synced_at       INTEGER NOT NULL DEFAULT 0,
+                visible         INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS items (
@@ -255,6 +256,7 @@ impl Store {
         // `CREATE TABLE IF NOT EXISTS` for the new tables, so add the columns
         // explicitly. `pragma_table_info` is a table-valued function (SQLite
         // 3.16+) and lets us keep this idempotent.
+        self.ensure_column("libraries", "visible", "INTEGER NOT NULL DEFAULT 1")?;
         for (column, decl) in [
             ("status", "TEXT NOT NULL DEFAULT 'untranslated'"),
             ("locked", "INTEGER NOT NULL DEFAULT 0"),
@@ -327,6 +329,44 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Libraries the user chose to keep on the home tab (`visible = 1`).
+    pub fn list_visible_libraries(&self) -> Result<Vec<LibraryRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, collection_type FROM libraries
+             WHERE visible = 1 ORDER BY name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(LibraryRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                collection_type: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Hide every locally known library except `visible_ids`.
+    ///
+    /// Only the visibility flag changes; libraries and their items are kept.
+    /// Passing an empty slice therefore hides all libraries (callers should
+    /// guard against an empty user selection).
+    pub fn set_library_visibility(&mut self, visible_ids: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("UPDATE libraries SET visible = 0", [])?;
+        {
+            let mut stmt = tx.prepare("UPDATE libraries SET visible = 1 WHERE id = ?1")?;
+            for id in visible_ids {
+                stmt.execute([id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn library_item_counts(&self) -> Result<HashMap<String, usize>> {
@@ -851,6 +891,72 @@ mod tests {
 
         store.delete_preset(" tom hanks").unwrap();
         assert!(store.presets().unwrap().is_empty());
+    }
+
+    #[test]
+    fn library_visibility_hides_but_keeps_data() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .upsert_libraries(&[
+                LibraryRecord {
+                    id: "a".into(),
+                    name: "A".into(),
+                    collection_type: None,
+                },
+                LibraryRecord {
+                    id: "b".into(),
+                    name: "B".into(),
+                    collection_type: None,
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(store.list_libraries().unwrap().len(), 2);
+        assert_eq!(store.list_visible_libraries().unwrap().len(), 2);
+
+        store.set_library_visibility(&["a".into()]).unwrap();
+        let visible = store.list_visible_libraries().unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "a");
+        // Hidden state keeps the row (and would keep its items).
+        assert_eq!(store.list_libraries().unwrap().len(), 2);
+
+        store
+            .set_library_visibility(&["a".into(), "b".into()])
+            .unwrap();
+        assert_eq!(store.list_visible_libraries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn migrates_old_libraries_table_with_visible_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE libraries (
+                    id              TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL,
+                    collection_type TEXT,
+                    synced_at       INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO libraries VALUES ('old', 'Old library', NULL, 1);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(&path).unwrap();
+        // Existing row got visible = 1 from the ALTER default.
+        let visible = store.list_visible_libraries().unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "old");
+
+        // The new column is writable after migration.
+        store.set_library_visibility(&[]).unwrap();
+        assert!(store.list_visible_libraries().unwrap().is_empty());
+        assert_eq!(store.list_libraries().unwrap().len(), 1);
     }
 
     #[test]

@@ -1197,3 +1197,61 @@ async fn empty_field_selection_is_a_noop() {
     assert_eq!(report.written, 0);
     assert!(fake.updates().is_empty());
 }
+
+#[tokio::test]
+async fn only_selected_libraries_are_visible_on_the_home_tab() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies"), library("shows", "Shows")],
+        vec![
+            ("movies".to_string(), movie("m1", "Inception")),
+            ("movies".to_string(), movie("m2", "Interstellar")),
+            ("shows".to_string(), series("s1", "Breaking Bad")),
+        ],
+    );
+    let service = AppService::open_in_memory().unwrap();
+    service.install_api(fake).unwrap();
+
+    // First selection syncs both libraries: both visible.
+    service
+        .sync_libraries(vec!["movies".to_string(), "shows".to_string()], |_| {})
+        .await
+        .unwrap();
+    let visible = service.libraries().unwrap();
+    assert_eq!(visible.len(), 2);
+
+    // Re-sync only Movies: Shows disappears from the home tab...
+    service
+        .sync_libraries(vec!["movies".to_string()], |_| {})
+        .await
+        .unwrap();
+    let visible = service.libraries().unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].id, "movies");
+    assert_eq!(visible[0].item_count, 2);
+
+    // ...but its rows and items are kept.
+    assert_eq!(service.items("shows").unwrap().len(), 1);
+    assert_eq!(service.items("shows").unwrap()[0].title, "Breaking Bad");
+
+    // The selection dialog still sees every server library with local counts.
+    let remote = service.remote_libraries().await.unwrap();
+    assert_eq!(remote.len(), 2);
+    let shows = remote.iter().find(|library| library.id == "shows").unwrap();
+    assert_eq!(shows.item_count, 1);
+
+    // Re-selecting both restores both on the home tab.
+    service
+        .sync_libraries(vec!["movies".to_string(), "shows".to_string()], |_| {})
+        .await
+        .unwrap();
+    assert_eq!(service.libraries().unwrap().len(), 2);
+
+    // An empty or unknown-only selection must not hide everything.
+    service.sync_libraries(Vec::new(), |_| {}).await.unwrap();
+    assert_eq!(service.libraries().unwrap().len(), 2);
+    service
+        .sync_libraries(vec!["does-not-exist".to_string()], |_| {})
+        .await
+        .unwrap();
+    assert_eq!(service.libraries().unwrap().len(), 2);
+}

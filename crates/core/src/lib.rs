@@ -421,7 +421,7 @@ impl AppService {
 
     pub fn libraries(&self) -> Result<Vec<LibraryView>> {
         let inner = self.inner()?;
-        let libraries = inner.store.list_libraries()?;
+        let libraries = inner.store.list_visible_libraries()?;
         let counts = inner.store.library_item_counts()?;
         Ok(libraries
             .into_iter()
@@ -466,6 +466,7 @@ impl AppService {
     {
         let started = Instant::now();
         let api = self.api()?;
+        let has_selection = !library_ids.is_empty();
         let selected = library_ids.into_iter().collect::<HashSet<_>>();
         let libraries = api
             .libraries()
@@ -486,6 +487,16 @@ impl AppService {
         {
             let mut inner = self.inner()?;
             inner.store.upsert_libraries(&records)?;
+            // Keep the data of deselected libraries, only hide them from the
+            // home tab. An empty (or entirely unknown) selection leaves the
+            // current visibility untouched.
+            if has_selection && !libraries.is_empty() {
+                let visible_ids = libraries
+                    .iter()
+                    .map(|library| library.id.clone())
+                    .collect::<Vec<_>>();
+                inner.store.set_library_visibility(&visible_ids)?;
+            }
         }
 
         let total_libraries = libraries.len();
