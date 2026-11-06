@@ -23,7 +23,7 @@ use gpui_kit::*;
 
 use crate::covers;
 use crate::ui;
-use crate::views::{connect, library, presets, settings, tasks};
+use crate::views::{connect, library, presets, settings, sync_picker, tasks};
 
 /// Pages reachable from the sidebar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,12 +67,22 @@ enum SyncEvent {
     Failed(String),
 }
 
+/// Optional primary action offered by the error dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ErrorAction {
+    /// Open the translation provider settings.
+    TranslateSettings,
+    /// Open the Jellyfin connection page.
+    ConnectServer,
+}
+
 /// A blocking, centred error message (used when an action fails while a
 /// drawer/modal is open, where a toast would be too easy to miss).
 #[derive(Clone)]
 pub(crate) struct ErrorDialog {
     pub(crate) title: SharedString,
     pub(crate) detail: SharedString,
+    pub(crate) action: Option<ErrorAction>,
 }
 
 /// Root entity: page routing, the shared service handle, page state and the
@@ -94,6 +104,7 @@ pub(crate) struct AppState {
     pub(crate) error_dialog: Option<ErrorDialog>,
     pub(crate) covers: covers::CoverCache,
     pub(crate) cover_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) sync_picker: sync_picker::SyncPickerState,
 }
 
 impl AppState {
@@ -126,6 +137,7 @@ impl AppState {
             error_dialog: None,
             covers: covers::CoverCache::new(),
             cover_permits: Arc::new(tokio::sync::Semaphore::new(6)),
+            sync_picker: sync_picker::SyncPickerState::default(),
         }
     }
 
@@ -268,6 +280,40 @@ impl AppState {
         .detach();
     }
 
+    /// Run an async service call on the tokio runtime (no window needed).
+    pub(crate) fn spawn_async_job<T>(
+        &mut self,
+        cx: &mut Context<Self>,
+        task: impl FnOnce(Arc<AppService>) -> JobFuture<T> + Send + 'static,
+        then: impl FnOnce(&mut Self, Result<T, String>, &mut Context<Self>) + 'static,
+    ) where
+        T: Send + 'static,
+    {
+        let Some(service) = self.service.clone() else {
+            self.service_error = Some("本地数据服务尚未就绪".into());
+            cx.notify();
+            return;
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<T, String>>();
+        self.runtime.spawn(async move {
+            let result = task(service).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            let result = match rx.recv().await {
+                Some(result) => result,
+                None => Err("后台任务意外结束".to_string()),
+            };
+            this.update(cx, |this, cx| {
+                then(this, result, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Run an async service call on the tokio runtime.
     pub(crate) fn spawn_async_job_in<T>(
         &mut self,
@@ -334,9 +380,21 @@ impl AppState {
         detail: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
+        self.show_error_with_action(title, detail, Some(ErrorAction::TranslateSettings), cx);
+    }
+
+    /// Show the error dialog with a specific primary action (or none).
+    pub(crate) fn show_error_with_action(
+        &mut self,
+        title: impl Into<SharedString>,
+        detail: impl Into<SharedString>,
+        action: Option<ErrorAction>,
+        cx: &mut Context<Self>,
+    ) {
         self.error_dialog = Some(ErrorDialog {
             title: title.into(),
             detail: detail.into(),
+            action,
         });
         cx.notify();
     }
@@ -357,14 +415,13 @@ impl AppState {
         cx.notify();
     }
 
-    /// Mirror every Jellyfin library into the local store.
+    /// Sync only the selected Jellyfin libraries into the local store.
     ///
-    /// `sync_all` reports progress through a callback; the callback forwards
-    /// each update into an unbounded channel whose receiver is polled by a
-    /// GPUI foreground task, so neither the UI thread nor the progress channel
-    /// ever blocks.
-    pub(crate) fn start_sync(&mut self, cx: &mut Context<Self>) {
-        if self.sync.running {
+    /// Progress is forwarded from the core callback over an unbounded channel
+    /// to a GPUI foreground task; on success the picker closes, libraries are
+    /// re-read and the first synced library becomes active.
+    pub(crate) fn start_library_sync(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        if self.sync.running || ids.is_empty() {
             return;
         }
         let Some(service) = self.service.clone() else {
@@ -377,13 +434,16 @@ impl AppState {
         self.sync.progress = None;
         self.sync.report = None;
         self.sync.error = None;
+        self.sync_picker.error = None;
         cx.notify();
 
+        let first_library = ids.first().cloned();
+        let ids_for_job = ids;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SyncEvent>();
         self.runtime.spawn(async move {
             let progress_tx = tx.clone();
             let result = service
-                .sync_all(move |progress| {
+                .sync_libraries(ids_for_job, move |progress| {
                     let _ = progress_tx.send(SyncEvent::Progress(progress));
                 })
                 .await;
@@ -415,6 +475,9 @@ impl AppState {
                                 this.sync.progress = None;
                                 this.sync.report = Some(report);
                                 this.sync.error = None;
+                                this.sync_picker.open = false;
+                                this.sync_picker.error = None;
+                                this.page = Page::Library;
                                 this.record_task("同步", message.clone(), true, cx);
                                 this.notify_toast(message, cx);
                                 // The mirror changed underneath us: drop the
@@ -423,15 +486,17 @@ impl AppState {
                                 this.library.items.clear();
                                 this.library.selected.clear();
                                 this.library.drawer = None;
-                                this.library.active_lib = None;
+                                this.library.active_lib = first_library.clone();
                                 this.load_libraries(cx);
                             }
                             SyncEvent::Failed(message) => {
                                 this.sync.running = false;
                                 this.sync.progress = None;
                                 this.sync.error = Some(message.clone().into());
+                                this.sync_picker.error =
+                                    Some(format!("同步失败：{message}").into());
                                 this.record_task("同步", message.clone(), false, cx);
-                                this.notify_toast(message, cx);
+                                this.notify_toast(format!("同步失败：{message}"), cx);
                             }
                         }
                         cx.notify();
@@ -450,6 +515,7 @@ impl AppState {
                         this.sync.running = false;
                         this.sync.progress = None;
                         this.sync.error = Some("同步任务意外结束".into());
+                        this.sync_picker.error = Some("同步任务意外结束，请重试".into());
                         cx.notify();
                     }
                 })
@@ -1387,16 +1453,29 @@ impl AppState {
                             .label("关闭")
                             .on_click(close),
                     )
-                    .child(
-                        Button::new("error-goto-settings")
-                            .primary()
-                            .label("去设置配置翻译服务")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.error_dialog = None;
-                                this.library.drawer = None;
-                                this.navigate_external(Page::Settings, window, cx);
-                            })),
-                    ),
+                    .when_some(dialog.action, |row, action| match action {
+                        ErrorAction::TranslateSettings => row.child(
+                            Button::new("error-goto-settings")
+                                .primary()
+                                .label("去设置配置翻译服务")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.error_dialog = None;
+                                    this.library.drawer = None;
+                                    this.navigate_external(Page::Settings, window, cx);
+                                })),
+                        ),
+                        ErrorAction::ConnectServer => row.child(
+                            Button::new("error-goto-connect")
+                                .primary()
+                                .label("去连接服务器")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.error_dialog = None;
+                                    this.library.drawer = None;
+                                    this.sync_picker.open = false;
+                                    this.navigate_external(Page::Connect, window, cx);
+                                })),
+                        ),
+                    }),
             );
 
         v_flex()
@@ -1489,6 +1568,10 @@ impl Render for AppState {
 
         if self.library.editing.is_some() {
             root = root.child(self.render_edit_modal(&theme, cx));
+        }
+
+        if self.sync_picker.open {
+            root = root.child(self.render_sync_picker(&theme, cx));
         }
 
         if self.toast.is_some() {

@@ -7,7 +7,7 @@
 //! client live behind an `Arc<Mutex<..>>`, and no lock is held across an
 //! `.await`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -182,6 +182,15 @@ struct Inner {
     /// Lets tests exercise `connect` without a real server.
     #[cfg(test)]
     client_factory: Option<Arc<ClientFactory>>,
+}
+
+/// Shared context for one `sync_libraries` run (keeps the helper's argument
+/// list readable and the progress callback borrowed across the loop).
+struct SyncRun<'a, F> {
+    api: &'a dyn JellyfinApi,
+    include_types: &'a [String],
+    progress: &'a F,
+    libraries_total: usize,
 }
 
 pub struct AppService {
@@ -393,13 +402,47 @@ impl AppService {
             .collect())
     }
 
-    pub async fn sync_all<F>(&self, progress: F) -> Result<SyncReport>
+    /// List the media libraries on the server, without persisting them.
+    ///
+    /// `item_count` is how many items of that library already exist in the local
+    /// mirror (0 before the first sync). Returns the Chinese "not connected"
+    /// error when [`Self::connect`] has not succeeded yet.
+    pub async fn remote_libraries(&self) -> Result<Vec<LibraryView>> {
+        let api = self.api()?;
+        let libraries = api.libraries().await.context("读取 Jellyfin 媒体库")?;
+        let counts = {
+            let inner = self.inner()?;
+            inner.store.library_item_counts()?
+        };
+        Ok(libraries
+            .into_iter()
+            .map(|library| LibraryView {
+                item_count: counts.get(&library.id).copied().unwrap_or(0),
+                id: library.id,
+                name: library.name,
+            })
+            .collect())
+    }
+
+    /// Sync only the selected libraries. Unknown ids are ignored.
+    pub async fn sync_libraries<F>(
+        &self,
+        library_ids: Vec<String>,
+        progress: F,
+    ) -> Result<SyncReport>
     where
         F: Fn(SyncProgress) + Send + Sync + 'static,
     {
         let started = Instant::now();
         let api = self.api()?;
-        let libraries = api.libraries().await.context("读取 Jellyfin 媒体库")?;
+        let selected = library_ids.into_iter().collect::<HashSet<_>>();
+        let libraries = api
+            .libraries()
+            .await
+            .context("读取 Jellyfin 媒体库")?
+            .into_iter()
+            .filter(|library| selected.contains(&library.id))
+            .collect::<Vec<_>>();
 
         let records = libraries
             .iter()
@@ -427,48 +470,16 @@ impl AppService {
             message: format!("准备同步 {total_libraries} 个媒体库"),
         });
 
+        let run = SyncRun {
+            api: api.as_ref(),
+            include_types: &include_types,
+            progress: &progress,
+            libraries_total: total_libraries,
+        };
         for (library_index, library) in libraries.iter().enumerate() {
-            let mut start = 0usize;
-            loop {
-                let page = api
-                    .items_page(Some(&library.id), &include_types, start, PAGE_SIZE)
-                    .await
-                    .with_context(|| format!("分页读取媒体库 {} ({})", library.name, library.id))?;
-                if page.items.is_empty() {
-                    break;
-                }
-
-                let count = page.items.len();
-                let records = page
-                    .items
-                    .iter()
-                    .map(|dto| item_record_from_dto(&library.id, dto))
-                    .collect::<Vec<_>>();
-                {
-                    let mut inner = self.inner()?;
-                    inner.store.upsert_items(&records)?;
-                }
-                total_items += count;
-                start += count;
-                // `total_record_count` is authoritative when present; fall back
-                // to a short page when a server omits it.
-                let reached_total =
-                    page.total_record_count > 0 && start as i64 >= page.total_record_count;
-                if reached_total || count < PAGE_SIZE {
-                    break;
-                }
-            }
-
-            let done = library_index + 1;
-            progress(SyncProgress {
-                libraries_done: done,
-                libraries_total: total_libraries,
-                items: total_items,
-                message: format!(
-                    "已同步 {done}/{total_libraries} 个媒体库（{total_items} 个条目）"
-                ),
-            });
-            tracing::debug!(library = %library.name, items = total_items, "library synced");
+            total_items = self
+                .sync_one_library(&run, library, library_index + 1, total_items)
+                .await?;
         }
 
         let report = SyncReport {
@@ -483,6 +494,78 @@ impl AppService {
             "sync finished"
         );
         Ok(report)
+    }
+
+    /// Sync every library advertised by the server.
+    pub async fn sync_all<F>(&self, progress: F) -> Result<SyncReport>
+    where
+        F: Fn(SyncProgress) + Send + Sync + 'static,
+    {
+        let library_ids = self
+            .remote_libraries()
+            .await?
+            .into_iter()
+            .map(|library| library.id)
+            .collect::<Vec<_>>();
+        self.sync_libraries(library_ids, progress).await
+    }
+
+    /// Page through one library into the local store. Returns the running item
+    /// total so the caller can keep reporting cumulative progress.
+    async fn sync_one_library<F>(
+        &self,
+        run: &SyncRun<'_, F>,
+        library: &jellyfin::Library,
+        libraries_done: usize,
+        items_before: usize,
+    ) -> Result<usize>
+    where
+        F: Fn(SyncProgress) + Send + Sync + 'static,
+    {
+        let mut start = 0usize;
+        let mut total_items = items_before;
+        loop {
+            let page = run
+                .api
+                .items_page(Some(&library.id), run.include_types, start, PAGE_SIZE)
+                .await
+                .with_context(|| format!("分页读取媒体库 {} ({})", library.name, library.id))?;
+            if page.items.is_empty() {
+                break;
+            }
+
+            let count = page.items.len();
+            let records = page
+                .items
+                .iter()
+                .map(|dto| item_record_from_dto(&library.id, dto))
+                .collect::<Vec<_>>();
+            {
+                let mut inner = self.inner()?;
+                inner.store.upsert_items(&records)?;
+            }
+            total_items += count;
+            start += count;
+            // `total_record_count` is authoritative when present; fall back to a
+            // short page when a server omits it.
+            let reached_total =
+                page.total_record_count > 0 && start as i64 >= page.total_record_count;
+            if reached_total || count < PAGE_SIZE {
+                break;
+            }
+        }
+
+        (run.progress)(SyncProgress {
+            libraries_done,
+            libraries_total: run.libraries_total,
+            items: total_items,
+            message: format!(
+                "已同步 {libraries_done}/{} 个媒体库（{total_items} 个条目）",
+                run.libraries_total
+            ),
+        });
+        tracing::debug!(library = %library.name, items = total_items, "library synced");
+        Ok(total_items)
     }
 
     pub fn items(&self, library_id: &str) -> Result<Vec<ItemView>> {

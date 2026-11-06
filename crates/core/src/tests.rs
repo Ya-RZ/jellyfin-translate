@@ -849,3 +849,125 @@ async fn connect_persists_credentials_after_success() {
     drop(service);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn series(id: &str, name: &str) -> jellyfin::ItemDto {
+    jellyfin::ItemDto {
+        id: id.to_string(),
+        name: Some(name.to_string()),
+        item_type: Some("Series".into()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn remote_libraries_lists_server_libraries_with_local_counts() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies"), library("shows", "Shows")],
+        vec![
+            ("movies".to_string(), movie("m1", "Inception")),
+            ("shows".to_string(), series("s1", "Breaking Bad")),
+        ],
+    );
+    let service = AppService::open_in_memory().unwrap();
+    service.install_api(fake).unwrap();
+
+    // Remote listing works before any sync and reports zero local items; it
+    // must not persist libraries as a side effect.
+    let remote = service.remote_libraries().await.unwrap();
+    assert_eq!(remote.len(), 2);
+    assert_eq!(remote[0].id, "movies");
+    assert_eq!(remote[0].name, "Movies");
+    assert_eq!(remote[0].item_count, 0);
+    assert_eq!(remote[1].item_count, 0);
+    assert!(service.libraries().unwrap().is_empty());
+
+    service.sync_all(|_| {}).await.unwrap();
+    let remote = service.remote_libraries().await.unwrap();
+    let movies = remote
+        .iter()
+        .find(|library| library.id == "movies")
+        .unwrap();
+    let shows = remote.iter().find(|library| library.id == "shows").unwrap();
+    assert_eq!(movies.item_count, 1);
+    assert_eq!(shows.item_count, 1);
+}
+
+#[tokio::test]
+async fn sync_libraries_only_syncs_selected_ids_and_ignores_unknown() {
+    let fake = FakeApi::new(
+        vec![
+            library("movies", "Movies"),
+            library("shows", "Shows"),
+            library("docs", "Docs"),
+        ],
+        vec![
+            ("movies".to_string(), movie("m1", "Inception")),
+            ("movies".to_string(), movie("m2", "Interstellar")),
+            ("shows".to_string(), series("s1", "Breaking Bad")),
+        ],
+    );
+    let service = AppService::open_in_memory().unwrap();
+    service.install_api(fake).unwrap();
+
+    let progress = Arc::new(Mutex::new(Vec::new()));
+    let sink = progress.clone();
+    let report = service
+        .sync_libraries(
+            vec![
+                "shows".to_string(),
+                "does-not-exist".to_string(),
+                "shows".to_string(),
+            ],
+            move |snapshot| sink.lock().unwrap().push(snapshot),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.libraries, 1);
+    assert_eq!(report.items, 1);
+    assert!(service.items("movies").unwrap().is_empty());
+    assert!(service.items("docs").unwrap().is_empty());
+    assert_eq!(service.items("shows").unwrap().len(), 1);
+    assert_eq!(service.items("shows").unwrap()[0].title, "Breaking Bad");
+
+    // Only the selected library is persisted locally.
+    let libraries = service.libraries().unwrap();
+    assert_eq!(libraries.len(), 1);
+    assert_eq!(libraries[0].id, "shows");
+    assert_eq!(libraries[0].item_count, 1);
+
+    {
+        let snapshots = progress.lock().unwrap();
+        let last = snapshots.last().unwrap();
+        assert_eq!(last.libraries_done, 1);
+        assert_eq!(last.libraries_total, 1);
+        assert_eq!(last.items, 1);
+    }
+
+    // An unknown-only selection is a no-op, not an error.
+    let report = service
+        .sync_libraries(vec!["nope".to_string()], |_| {})
+        .await
+        .unwrap();
+    assert_eq!(report.libraries, 0);
+    assert_eq!(report.items, 0);
+}
+
+#[tokio::test]
+async fn remote_and_selected_sync_require_a_connection() {
+    let service = AppService::open_in_memory().unwrap();
+    let errors = [
+        service.remote_libraries().await.unwrap_err().to_string(),
+        service
+            .sync_libraries(vec!["movies".to_string()], |_| {})
+            .await
+            .unwrap_err()
+            .to_string(),
+    ];
+    for error in errors {
+        assert!(
+            error.contains("尚未连接 Jellyfin 服务器"),
+            "unexpected error: {error}"
+        );
+    }
+}

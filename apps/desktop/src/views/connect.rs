@@ -154,6 +154,13 @@ impl AppState {
                         this.library.selected.clear();
                         this.library.drawer = None;
                         this.load_libraries(cx);
+                        // Only a manual connection opens the picker; the
+                        // saved-config auto-connect at startup should not pop a
+                        // modal over the user's library view. The toolbar
+                        // button is always available.
+                        if !auto {
+                            this.open_sync_picker(cx);
+                        }
                     }
                     Err(message) => {
                         this.connect.server = None;
@@ -298,7 +305,7 @@ impl AppState {
                                 })
                                 .loading(running)
                                 .disabled(running)
-                                .on_click(cx.listener(|this, _, _, cx| this.start_sync(cx))),
+                                .on_click(cx.listener(|this, _, _, cx| this.open_sync_picker(cx))),
                         )
                         .child(
                             div()

@@ -659,7 +659,14 @@ impl AppState {
             .pt(px(22.))
             .pb(px(16.))
             .child(ui::page_head(active_name, description, theme))
-            .child(div().flex_1());
+            .child(div().flex_1())
+            .child(
+                Button::new("sync-libraries")
+                    .small()
+                    .label("同步媒体库")
+                    .disabled(self.sync.running)
+                    .on_click(cx.listener(|this, _, _, cx| this.open_sync_picker(cx))),
+            );
 
         if self.library.multi {
             head = head.child(
@@ -868,7 +875,9 @@ impl AppState {
                                     })
                                     .loading(running)
                                     .disabled(running || self.service.is_none())
-                                    .on_click(cx.listener(|this, _, _, cx| this.start_sync(cx))),
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_sync_picker(cx)),
+                                    ),
                             ),
                     );
 
@@ -923,7 +932,7 @@ impl AppState {
                         })
                         .loading(running)
                         .disabled(running || self.service.is_none())
-                        .on_click(cx.listener(|this, _, _, cx| this.start_sync(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.open_sync_picker(cx))),
                 );
             }
 
