@@ -124,15 +124,7 @@ impl OpenAiTranslator {
             )
         })?;
 
-        let json_text = extract_json(&content);
-        let parsed: SegmentPayload = serde_json::from_str(json_text).map_err(|e| {
-            anyhow!(
-                "openai: model response was not segment JSON ({e}): {}",
-                snippet(&content)
-            )
-        })?;
-
-        let texts = align(segments, parsed.segments)?;
+        let texts = parse_content(&content, segments)?;
         Ok((texts, token_count(completion.usage)))
     }
 }
@@ -428,6 +420,144 @@ fn extract_json(content: &str) -> &str {
     }
 }
 
+/// Parses the assistant message into translations, tolerating the shapes models
+/// actually emit in the wild. Field-specific prompt templates and some gateways
+/// ignore the requested JSON contract, so the accepted forms are, in order:
+///
+/// 1. the canonical `{"segments":[{"id":"..","text":".."}]}` payload;
+/// 2. a bare JSON string (`"你好"`);
+/// 3. an object carrying `text` / `translation` / `content` / `result` (or
+///    `segments`) as a string or as an array of strings;
+/// 4. a top-level array of strings (aligned by position);
+/// 5. for a single input only, the whole cleaned content as plain text.
+fn parse_content(content: &str, expected: &[&Segment]) -> Result<Vec<String>> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err(unparsable(content, expected.len()));
+    }
+
+    let json_text = extract_json(trimmed);
+
+    // 1) Canonical segment payload.
+    if let Ok(payload) = serde_json::from_str::<SegmentPayload>(json_text) {
+        if !payload.segments.is_empty() {
+            match align(expected, payload.segments) {
+                Ok(texts) => return Ok(texts),
+                Err(error) => tracing::debug!(
+                    provider = "openai",
+                    %error,
+                    "segment payload did not align; trying tolerant shapes"
+                ),
+            }
+        }
+    }
+
+    // 2-4) JSON string, object with a text-like field, or array of strings.
+    if let Ok(value) = serde_json::from_str::<Value>(json_text) {
+        if let Some(texts) = texts_from_value(&value, expected.len()) {
+            return Ok(texts);
+        }
+        return Err(unparsable(trimmed, expected.len()));
+    }
+
+    // 5) Not JSON at all: with a single input the cleaned content is the
+    //    translation (models often answer with just the translated string).
+    if expected.len() == 1 {
+        let cleaned = clean_plain_text(trimmed);
+        if !cleaned.is_empty() {
+            return Ok(vec![cleaned]);
+        }
+    }
+
+    Err(unparsable(trimmed, expected.len()))
+}
+
+/// Extracts translations from a decoded JSON value, accepting string fields as
+/// well as arrays of strings (or arrays of objects with a text-like field).
+fn texts_from_value(value: &Value, expected_len: usize) -> Option<Vec<String>> {
+    match value {
+        Value::String(text) if expected_len == 1 => Some(vec![text.clone()]),
+        Value::Array(items) if items.len() == expected_len => collect_texts(items),
+        Value::Object(map) => {
+            for key in ["text", "translation", "content", "result", "segments"] {
+                let Some(inner) = map.get(key) else {
+                    continue;
+                };
+                match inner {
+                    Value::String(text) if expected_len == 1 => return Some(vec![text.clone()]),
+                    Value::Array(items) if items.len() == expected_len => {
+                        if let Some(texts) = collect_texts(items) {
+                            return Some(texts);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn collect_texts(items: &[Value]) -> Option<Vec<String>> {
+    items
+        .iter()
+        .map(|item| match item {
+            Value::String(text) => Some(text.clone()),
+            Value::Object(map) => ["text", "translation", "content", "result"]
+                .iter()
+                .find_map(|key| map.get(*key).and_then(Value::as_str))
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
+fn unparsable(content: &str, expected_len: usize) -> anyhow::Error {
+    anyhow!(
+        "openai: 翻译服务返回了无法解析的内容：{}（期望 {expected_len} 段译文）",
+        snippet(content)
+    )
+}
+
+/// Strips markdown code fences and wrapping quotes from a plain-text answer.
+fn clean_plain_text(content: &str) -> String {
+    let trimmed = content.trim();
+    let without_fence = if let Some(rest) = trimmed.strip_prefix("```") {
+        let rest = rest
+            .strip_prefix("json")
+            .or_else(|| rest.strip_prefix("JSON"))
+            .unwrap_or(rest);
+        let rest = rest.trim_start();
+        match rest.rfind("```") {
+            Some(end) => rest[..end].trim(),
+            None => rest.trim(),
+        }
+    } else {
+        trimmed
+    };
+    strip_wrapping_quotes(without_fence).to_owned()
+}
+
+fn strip_wrapping_quotes(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim();
+        let mut chars = trimmed.chars();
+        let (Some(first), Some(last)) = (chars.next(), chars.next_back()) else {
+            return trimmed;
+        };
+        let matching = matches!(
+            (first, last),
+            ('"', '"') | ('\'', '\'') | ('“', '”') | ('‘', '’') | ('「', '」') | ('『', '』')
+        );
+        if matching && trimmed.len() >= first.len_utf8() + last.len_utf8() {
+            text = &trimmed[first.len_utf8()..trimmed.len() - last.len_utf8()];
+        } else {
+            return trimmed;
+        }
+    }
+}
+
 fn snippet(body: &str) -> String {
     const LIMIT: usize = 300;
     let trimmed = body.trim();
@@ -466,6 +596,31 @@ mod tests {
                 text: "World".to_owned(),
             },
         ]
+    }
+
+    fn single_segment_request() -> TranslateRequest {
+        request(vec![Segment {
+            id: "s1".to_owned(),
+            text: "Hello".to_owned(),
+        }])
+    }
+
+    fn translator(server: &MockServer) -> OpenAiTranslator {
+        OpenAiTranslator::new(
+            format!("{}/v1", server.base_url()),
+            "test-key".to_owned(),
+            "test-model".to_owned(),
+        )
+        .unwrap()
+    }
+
+    fn mock_chat<'a>(server: &'a MockServer, content: &str) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(json!({
+                "choices": [{ "message": { "role": "assistant", "content": content } }]
+            }));
+        })
     }
 
     #[tokio::test]
@@ -541,22 +696,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_once_then_reports_malformed_content() {
+    async fn multi_segment_unparsable_content_reports_chinese_error() {
         let server = MockServer::start();
-        let mock = server.mock(|when, then| {
-            when.method(POST).path("/v1/chat/completions");
-            then.status(200).json_body(json!({
-                "choices": [{ "message": { "role": "assistant", "content": "I cannot help with that." } }]
-            }));
-        });
+        let mock = mock_chat(&server, "I cannot help with that.");
 
-        let translator = OpenAiTranslator::new(
-            format!("{}/v1", server.base_url()),
-            "test-key".to_owned(),
-            "test-model".to_owned(),
-        )
-        .unwrap();
-        let error = translator
+        let error = translator(&server)
             .translate(request(segments()))
             .await
             .unwrap_err()
@@ -564,7 +708,92 @@ mod tests {
 
         mock.assert_hits(2);
         assert!(error.contains("openai"), "unexpected error: {error}");
-        assert!(error.contains("segment JSON"), "unexpected error: {error}");
+        assert!(
+            error.contains("翻译服务返回了无法解析的内容"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("I cannot help with that."),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_plain_text_for_single_segment() {
+        let server = MockServer::start();
+        let mock = mock_chat(&server, "  你好  ");
+
+        let response = translator(&server)
+            .translate(single_segment_request())
+            .await
+            .unwrap();
+
+        mock.assert_hits(1);
+        assert_eq!(response.segments[0].id, "s1");
+        assert_eq!(response.segments[0].text, "你好");
+    }
+
+    #[tokio::test]
+    async fn accepts_text_field_object_for_single_segment() {
+        let server = MockServer::start();
+        let mock = mock_chat(&server, r#"{"text":"你好"}"#);
+
+        let response = translator(&server)
+            .translate(single_segment_request())
+            .await
+            .unwrap();
+
+        mock.assert_hits(1);
+        assert_eq!(response.segments[0].text, "你好");
+    }
+
+    #[tokio::test]
+    async fn accepts_string_array_by_position() {
+        let server = MockServer::start();
+        let mock = mock_chat(&server, r#"["你好","世界"]"#);
+
+        let response = translator(&server)
+            .translate(request(segments()))
+            .await
+            .unwrap();
+
+        mock.assert_hits(1);
+        assert_eq!(response.segments[0].text, "你好");
+        assert_eq!(response.segments[1].text, "世界");
+    }
+
+    #[tokio::test]
+    async fn accepts_fenced_segment_json_with_surrounding_noise() {
+        let server = MockServer::start();
+        let mock = mock_chat(
+            &server,
+            "Sure, here it is:\n```json\n{\"segments\":[{\"id\":\"s1\",\"text\":\"你好\"}]}\n```",
+        );
+
+        let response = translator(&server)
+            .translate(single_segment_request())
+            .await
+            .unwrap();
+
+        mock.assert_hits(1);
+        assert_eq!(response.segments[0].text, "你好");
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_positional_order_when_ids_are_missing() {
+        let server = MockServer::start();
+        let mock = mock_chat(&server, r#"{"segments":[{"text":"你好"},{"text":"世界"}]}"#);
+
+        let response = translator(&server)
+            .translate(request(segments()))
+            .await
+            .unwrap();
+
+        mock.assert_hits(1);
+        assert_eq!(response.segments[0].id, "s1");
+        assert_eq!(response.segments[0].text, "你好");
+        assert_eq!(response.segments[1].id, "s2");
+        assert_eq!(response.segments[1].text, "世界");
     }
 
     #[tokio::test]
