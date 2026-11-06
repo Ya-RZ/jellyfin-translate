@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ::core::{ItemView, LibraryView, TranslationStatus};
+use ::core::{ItemView, LibraryView, PersonView, TranslationStatus};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::component::switch::Switch;
@@ -14,7 +14,7 @@ use gpui_kit::*;
 use crate::app::{AppState, Page};
 use crate::covers;
 use crate::ui;
-use crate::views::edit_dialog::EditSource;
+use crate::views::edit_dialog::{EditSource, FieldEditorState};
 
 /// Status filter chips above the poster grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +51,12 @@ pub(crate) struct LibraryState {
     pub(crate) edit_busy: bool,
     pub(crate) edit_error: Option<SharedString>,
     pub(crate) edit_source: EditSource,
+    /// Current draft values for the two multi-row fields.
+    pub(crate) edit_tags: Vec<String>,
+    pub(crate) edit_people: Vec<PersonView>,
+    pub(crate) field_editor: Option<FieldEditorState>,
+    pub(crate) field_busy: bool,
+    pub(crate) field_error: Option<SharedString>,
     pub(crate) loading_libraries: bool,
     pub(crate) loading_items: bool,
     pub(crate) error: Option<SharedString>,
@@ -58,8 +64,6 @@ pub(crate) struct LibraryState {
     pub(crate) edit_title: Entity<TextareaState>,
     pub(crate) edit_orig: Entity<TextareaState>,
     pub(crate) edit_overview: Entity<TextareaState>,
-    pub(crate) edit_tags: Entity<TextareaState>,
-    pub(crate) edit_people: Entity<TextareaState>,
 }
 
 impl LibraryState {
@@ -76,6 +80,11 @@ impl LibraryState {
             edit_busy: false,
             edit_error: None,
             edit_source: EditSource::default(),
+            edit_tags: Vec::new(),
+            edit_people: Vec::new(),
+            field_editor: None,
+            field_busy: false,
+            field_error: None,
             loading_libraries: false,
             loading_items: false,
             error: None,
@@ -83,8 +92,6 @@ impl LibraryState {
             edit_title: cx.new(|cx| TextareaState::new(window, cx)),
             edit_orig: cx.new(|cx| TextareaState::new(window, cx)),
             edit_overview: cx.new(|cx| TextareaState::new(window, cx)),
-            edit_tags: cx.new(|cx| TextareaState::new(window, cx)),
-            edit_people: cx.new(|cx| TextareaState::new(window, cx)),
         }
     }
 
@@ -313,20 +320,15 @@ impl AppState {
             return;
         }
 
-        let people = item
-            .people
-            .iter()
-            .map(|person| match person.role.as_ref() {
-                Some(role) if !role.is_empty() => format!("{} / {}", person.name, role),
-                _ => person.name.clone(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
         self.library.editing = Some(item_id);
         self.library.edit_source = EditSource::from_item(&item);
+        self.library.edit_tags = item.tags.clone();
+        self.library.edit_people = item.people.clone();
         self.library.edit_busy = false;
         self.library.edit_error = None;
+        self.library.field_editor = None;
+        self.library.field_busy = false;
+        self.library.field_error = None;
         self.library.edit_title.update(cx, |state, cx| {
             state.set_value(item.title.clone(), window, cx)
         });
@@ -336,12 +338,6 @@ impl AppState {
         self.library.edit_overview.update(cx, |state, cx| {
             state.set_value(item.overview.clone(), window, cx)
         });
-        self.library.edit_tags.update(cx, |state, cx| {
-            state.set_value(item.tags.join(", "), window, cx)
-        });
-        self.library
-            .edit_people
-            .update(cx, |state, cx| state.set_value(people, window, cx));
         cx.notify();
     }
 

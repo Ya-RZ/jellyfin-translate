@@ -1098,7 +1098,7 @@ impl AppState {
             .gap(px(8.))
             .child(
                 Button::new("drawer-edit")
-                    .label("编辑")
+                    .label("详情")
                     .disabled(locked)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_edit(id_edit.clone(), window, cx)
@@ -1334,6 +1334,10 @@ impl Render for AppState {
 
         if self.library.editing_item().is_some() {
             root = root.child(self.render_edit_dialog(&theme, cx));
+        }
+
+        if self.library.field_editor.is_some() {
+            root = root.child(self.render_field_editor(&theme, cx));
         }
 
         if self.sync_picker.open {
