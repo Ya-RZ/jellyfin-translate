@@ -359,7 +359,6 @@ impl AppState {
                 h_flex()
                     .w_full()
                     .min_w_0()
-                    .items_center()
                     .gap_3()
                     .px(px(18.))
                     .py(px(14.))
@@ -393,7 +392,10 @@ impl AppState {
                             ),
                     )
                     .child(
-                        h_flex().flex_shrink_0().items_center().child(
+                        // Stretch this cell to the full row height and center the
+                        // button inside it; `items_center` on the row proved to
+                        // align the button with the source box instead.
+                        v_flex().flex_shrink_0().justify_center().child(
                             Button::new(format!("edit-field-open-{}", field.label()))
                                 .small()
                                 .label("编辑")
