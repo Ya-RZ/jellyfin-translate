@@ -38,5 +38,16 @@ jobs:
           tag_name: v0.1.0-pre
           name: v0.1.0-pre (Windows x64)
           prerelease: true
-          generate_release_notes: true
+          # 固定 tag 重复发版时，生成式说明会被追加到已有 body，导致重复。
+          # 关闭生成式说明，改用固定模板整体替换 body。
+          generate_release_notes: false
+          body: |
+            Windows x64 便携包。
+
+            - 提交：${{ github.sha }}
+            - 构建：#${{ github.run_number }}（[查看运行](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})）
+            - 解压后运行 `JellyfinTranslate.exe`；数据保存在 exe 同目录 `data\`。
+
+            这是预发布构建，可能包含未完成的改动。
           files: dist/JellyfinTranslate-windows-x64.zip
+          overwrite_files: true
