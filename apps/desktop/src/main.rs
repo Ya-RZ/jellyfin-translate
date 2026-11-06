@@ -38,11 +38,7 @@ fn main() {
                     title: Some("Jellyfin Translate".into()),
                     ..Default::default()
                 }),
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1280.), px(820.)),
-                    cx,
-                ))),
+                window_bounds: Some(WindowBounds::Windowed(main_window_bounds(cx))),
                 ..Default::default()
             },
             cx,
@@ -53,4 +49,27 @@ fn main() {
 
     // Don't wait for in-flight jobs when the window closes.
     runtime.shutdown_background();
+}
+
+/// Size the window to the primary display instead of blindly centering a fixed
+/// 1280×820 rectangle. On small or heavily scaled screens the fixed height can
+/// exceed the usable area, which pushes the title bar above the screen.
+fn main_window_bounds(cx: &mut App) -> Bounds<Pixels> {
+    let desired = size(px(1280.), px(820.));
+    let Some(display) = cx.primary_display() else {
+        return Bounds::centered(None, desired, cx);
+    };
+
+    let visible = display.visible_bounds();
+    // Keep a small margin and reserve room for the title bar / decorations:
+    // `visible_bounds` is the client area, so a window sized to its full
+    // height would put the top edge (and the title bar) off-screen.
+    let margin = px(16.);
+    let titlebar = px(56.);
+    let max_width = (visible.size.width - margin * 2.0).max(px(720.));
+    let max_height = (visible.size.height - titlebar - margin).max(px(480.));
+
+    let width = desired.width.min(max_width);
+    let height = desired.height.min(max_height);
+    Bounds::centered_at(visible.center(), size(width, height))
 }
