@@ -1012,18 +1012,8 @@ fn render_poster(
         );
     }
 
-    art = art.child(
-        div()
-            .px(px(8.))
-            .py(px(4.))
-            .rounded(px(5.))
-            .bg(hsla(0.0, 0.0, 0.0, 0.45))
-            .text_size(px(14.))
-            .font_semibold()
-            .line_clamp(3)
-            .text_color(hsla(0.0, 0.0, 1.0, 0.92))
-            .child(title.clone()),
-    );
+    // The title is rendered below the artwork only; overlaying it on the
+    // poster duplicated the text and covered the artwork.
 
     if multi {
         art = art.child(
