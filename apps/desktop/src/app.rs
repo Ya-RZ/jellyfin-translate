@@ -842,7 +842,7 @@ impl AppState {
                     ui::panel2(theme),
                 ),
                 ::core::TranslationStatus::Untranslated => (
-                    "○ 未翻译 — 点“翻译此视频”生成草稿。",
+                    "○ 未翻译 — 打开“编辑”，在弹窗里翻译。",
                     ui::muted(theme),
                     ui::panel2(theme),
                 ),
@@ -1087,10 +1087,7 @@ impl AppState {
             .into_any_element();
 
         let id_edit = item_id.clone();
-        let id_translate = item_id.clone();
-        let id_write = item_id.clone();
         let id_lock = item_id.clone();
-        let write_enabled = !locked && item.status == ::core::TranslationStatus::Draft;
         let lock_label = if locked { "解锁" } else { "锁定" };
 
         let footer = h_flex()
@@ -1105,23 +1102,6 @@ impl AppState {
                     .disabled(locked)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_edit(id_edit.clone(), window, cx)
-                    })),
-            )
-            .child(
-                Button::new("drawer-translate")
-                    .primary()
-                    .label("翻译此视频")
-                    .disabled(locked)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.translate_items(vec![id_translate.clone()], window, cx)
-                    })),
-            )
-            .child(
-                Button::new("drawer-write")
-                    .label("写回服务器")
-                    .disabled(!write_enabled)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.write_back_items(vec![id_write.clone()], window, cx)
                     })),
             )
             .child(
@@ -1142,220 +1122,6 @@ impl AppState {
                 cx.notify();
             }))
             .child(body)
-            .into_any_element()
-    }
-
-    fn render_edit_modal(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let title = self
-            .library
-            .editing_item()
-            .map(|item| format!("编辑 · {}", item.title))
-            .unwrap_or_else(|| "编辑视频".to_string());
-
-        let overlay = div()
-            .id("modal-overlay")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(hsla(0.0, 0.0, 0.0, 0.50))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.library.editing = None;
-                cx.notify();
-            }));
-
-        let card = v_flex()
-            .id("edit-dialog")
-            .occlude()
-            .w_full()
-            .max_w(px(680.))
-            .h_full()
-            .max_h(px(680.))
-            .rounded(px(14.))
-            .border_1()
-            .border_color(ui::border(theme))
-            .bg(theme.sidebar)
-            .overflow_hidden()
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .flex_shrink_0()
-                    .px(px(18.))
-                    .py(px(14.))
-                    .border_b_1()
-                    .border_color(ui::border(theme))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(15.))
-                            .font_semibold()
-                            .child(title),
-                    )
-                    .child(
-                        Button::new("modal-close")
-                            .ghost()
-                            .compact()
-                            .label("✕")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.library.editing = None;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .id("modal-body")
-                    .w_full()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p(px(18.))
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .min_w_0()
-                            .gap(px(14.))
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .gap(px(6.))
-                                    .child(ui::field_label("标题", theme).w_full())
-                                    .child(Input::new(&self.library.edit_title).w_full()),
-                            )
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .gap(px(6.))
-                                    .child(ui::field_label("原名", theme).w_full())
-                                    .child(Input::new(&self.library.edit_orig).w_full()),
-                            )
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .gap(px(6.))
-                                    .child(ui::field_label("简介", theme).w_full())
-                                    .child(
-                                        gpui_kit::component::input::Textarea::new(
-                                            &self.library.edit_overview,
-                                        )
-                                        .h(px(110.))
-                                        .w_full(),
-                                    ),
-                            )
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .gap(px(6.))
-                                    .child(ui::field_label("标签", theme).w_full())
-                                    .child(Input::new(&self.library.edit_tags).w_full())
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .min_w_0()
-                                            .whitespace_normal()
-                                            .text_size(px(11.5))
-                                            .text_color(ui::muted(theme))
-                                            .child("逗号分隔；写回时转成 Jellyfin Tags 数组。"),
-                                    ),
-                            )
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .gap(px(6.))
-                                    .child(ui::field_label("演职员（姓名 / 角色）", theme).w_full())
-                                    .child(
-                                        gpui_kit::component::input::Textarea::new(
-                                            &self.library.edit_people,
-                                        )
-                                        .h(px(110.))
-                                        .w_full(),
-                                    )
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .min_w_0()
-                                            .whitespace_normal()
-                                            .text_size(px(11.5))
-                                            .text_color(ui::muted(theme))
-                                            .child(
-                                                "每行一位，格式：姓名 / 角色；没有角色只写姓名。",
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .whitespace_normal()
-                                    .p(px(10.))
-                                    .rounded(px(9.))
-                                    .border_1()
-                                    .border_color(ui::border(theme))
-                                    .bg(theme.muted)
-                                    .text_size(px(12.))
-                                    .text_color(ui::muted(theme))
-                                    .child("编辑后先保存为草稿；确认无误再写回服务器。"),
-                            ),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .flex_shrink_0()
-                    .justify_end()
-                    .gap(px(8.))
-                    .px(px(18.))
-                    .py(px(14.))
-                    .border_t_1()
-                    .border_color(ui::border(theme))
-                    .child(
-                        Button::new("modal-cancel")
-                            .ghost()
-                            .label("取消")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.library.editing = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("modal-save-draft")
-                            .label("保存草稿")
-                            .disabled(self.library.edit_saving)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.save_edit(false, window, cx)
-                                }),
-                            ),
-                    )
-                    .child(
-                        Button::new("modal-save-write")
-                            .primary()
-                            .label("保存并写回")
-                            .loading(self.library.edit_saving)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.save_edit(true, window, cx)),
-                            ),
-                    ),
-            )
-            .into_any_element();
-
-        v_flex()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .items_center()
-            .justify_center()
-            .p(px(24.))
-            .child(overlay)
-            .child(card)
             .into_any_element()
     }
 
@@ -1566,8 +1332,8 @@ impl Render for AppState {
             }
         }
 
-        if self.library.editing.is_some() {
-            root = root.child(self.render_edit_modal(&theme, cx));
+        if self.library.editing_item().is_some() {
+            root = root.child(self.render_edit_dialog(&theme, cx));
         }
 
         if self.sync_picker.open {

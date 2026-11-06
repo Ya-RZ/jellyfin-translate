@@ -20,6 +20,8 @@ struct FakeApi {
     updates: Mutex<Vec<(String, Value)>>,
     /// Fields the simulated server refuses to persist (for verification tests).
     ignored_update_fields: Mutex<Vec<String>>,
+    /// Simulate a server that rejects DTOs containing this `LockedFields` value.
+    rejected_locked_field: Mutex<Option<String>>,
     image_calls: Mutex<Vec<(String, String, u32)>>,
 }
 
@@ -38,6 +40,7 @@ impl FakeApi {
             dtos: Mutex::new(dtos),
             updates: Mutex::new(Vec::new()),
             ignored_update_fields: Mutex::new(Vec::new()),
+            rejected_locked_field: Mutex::new(None),
             image_calls: Mutex::new(Vec::new()),
         })
     }
@@ -47,6 +50,10 @@ impl FakeApi {
             .lock()
             .unwrap()
             .push(field.to_string());
+    }
+
+    fn reject_locked_field(&self, field: &str) {
+        *self.rejected_locked_field.lock().unwrap() = Some(field.to_string());
     }
 
     fn updates(&self) -> Vec<(String, Value)> {
@@ -141,6 +148,26 @@ impl JellyfinApi for FakeApi {
 
     fn update_item<'a>(&'a self, item_id: &'a str, dto: &'a Value) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            // Record every attempt (including ones the fake server rejects), so
+            // retry behaviour can be asserted.
+            self.updates
+                .lock()
+                .unwrap()
+                .push((item_id.to_string(), dto.clone()));
+
+            if let Some(rejected) = self.rejected_locked_field.lock().unwrap().as_deref() {
+                let contains = dto
+                    .get("LockedFields")
+                    .and_then(Value::as_array)
+                    .map(|values| values.iter().any(|value| value.as_str() == Some(rejected)))
+                    .unwrap_or(false);
+                if contains {
+                    return Err(anyhow!(
+                        "HTTP 400: LockedFields value {rejected:?} is not a valid MetadataField"
+                    ));
+                }
+            }
+
             let mut stored = self.dtos.lock().unwrap();
             let old = stored.get(item_id).cloned().unwrap_or(Value::Null);
 
@@ -152,11 +179,6 @@ impl JellyfinApi for FakeApi {
                 }
             }
             stored.insert(item_id.to_string(), applied);
-            drop(stored);
-            self.updates
-                .lock()
-                .unwrap()
-                .push((item_id.to_string(), dto.clone()));
             Ok(())
         })
     }
@@ -408,6 +430,11 @@ async fn sync_pages_through_libraries_and_reports_progress() {
     assert_eq!(first.people.len(), 2);
     assert_eq!(first.people[0].id.as_deref(), Some("p1"));
     assert_eq!(first.people[1].id.as_deref(), Some("p2"));
+    // Source is the untouched server snapshot.
+    assert_eq!(first.source.title, first.title);
+    assert_eq!(first.source.overview, first.overview);
+    assert_eq!(first.source.tags, first.tags);
+    assert_eq!(first.source.people[0].id.as_deref(), Some("p1"));
 }
 
 #[tokio::test]
@@ -445,6 +472,12 @@ async fn translate_stores_drafts_uses_presets_and_skips_locked() {
     assert_eq!(item.people[0].role.as_deref(), Some("[zh-CN] Dom Cobb"));
     assert_eq!(item.people[1].name, "[zh-CN] Tom Hanks");
     assert_eq!(item.people[1].role.as_deref(), Some("[zh-CN] Narrator"));
+    // Effective values are the draft; source keeps the original English text.
+    assert_eq!(item.source.title, "Inception");
+    assert_eq!(item.source.overview, "Overview of Inception");
+    assert_eq!(item.source.tags, vec!["Sci-Fi", "Heist"]);
+    assert_eq!(item.source.people[0].name, "Leonardo DiCaprio");
+    assert_eq!(item.source.people[0].role.as_deref(), Some("Dom Cobb"));
 
     // Preset usage counter moved, and the field instructions were rendered.
     assert_eq!(service.presets().unwrap()[0].uses, 1);
@@ -970,4 +1003,197 @@ async fn remote_and_selected_sync_require_a_connection() {
             "unexpected error: {error}"
         );
     }
+}
+
+#[tokio::test]
+async fn translate_fields_only_translates_selected_fields() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    let service = synced_service(&fake).await;
+    let translator = EchoTranslator::new();
+    service.install_translator(translator.clone()).unwrap();
+
+    let report = service
+        .translate_fields(
+            "m1",
+            vec![FieldKind::Overview, FieldKind::Overview],
+            templates(),
+            settings(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.translated, 1);
+    assert!(report.failed.is_empty());
+
+    let item = service.items("movies").unwrap().remove(0);
+    assert_eq!(item.status, TranslationStatus::Draft);
+    assert_eq!(item.overview, "[zh-CN] Overview of Inception");
+    // Unselected fields are untouched.
+    assert_eq!(item.title, "Inception");
+    assert_eq!(item.original_title, "Inception");
+    assert_eq!(item.tags, vec!["Sci-Fi", "Heist"]);
+    assert_eq!(item.people[0].name, "Leonardo DiCaprio");
+    // Source still holds the server originals.
+    assert_eq!(item.source.title, "Inception");
+    assert_eq!(item.source.overview, "Overview of Inception");
+
+    // Duplicate selections are deduped: one provider request, one audit row.
+    let prompts = translator.prompts();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("简介模板"));
+    let rows = {
+        let inner = service.inner().unwrap();
+        inner.store.list_translations("m1").unwrap()
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].field, "overview");
+}
+
+#[tokio::test]
+async fn write_back_fields_only_writes_selected_field_and_keeps_draft() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    let service = synced_service(&fake).await;
+
+    service
+        .save_draft(
+            "m1",
+            ItemEdit {
+                title: "盗梦空间".into(),
+                original_title: "Inception".into(),
+                overview: "简介".into(),
+                tags: vec!["科幻".into()],
+                people: vec![PersonView {
+                    id: Some("p1".into()),
+                    name: "莱昂纳多".into(),
+                    role: Some("科布".into()),
+                }],
+            },
+        )
+        .unwrap();
+
+    let report = service
+        .write_back_fields("m1", vec![FieldKind::Overview])
+        .await
+        .unwrap();
+    assert_eq!(report.written, 1);
+    assert!(report.failed.is_empty());
+
+    let updates = fake.updates();
+    assert_eq!(updates.len(), 1);
+    let sent = &updates[0].1;
+    assert_eq!(sent["Overview"], "简介");
+    // Everything the user did not select keeps the server's original value.
+    assert_eq!(sent["Name"], "Inception");
+    assert_eq!(sent["OriginalTitle"], "Inception");
+    assert_eq!(sent["Tags"], json!(["Sci-Fi", "Heist"]));
+    assert_eq!(sent["People"][0]["Name"], "Leonardo DiCaprio");
+    let locked = sent["LockedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(locked.contains(&"Runtime"));
+    assert!(locked.contains(&"Overview"));
+    assert!(!locked.contains(&"Name"));
+    assert!(!locked.contains(&"Tags"));
+    assert!(!locked.contains(&"Cast"));
+
+    // A partial write-back keeps the item in Draft and stores the new locks.
+    let item = service.items("movies").unwrap().remove(0);
+    assert_eq!(item.status, TranslationStatus::Draft);
+    assert_eq!(item.title, "盗梦空间");
+    assert_eq!(item.overview, "简介");
+    let record = {
+        let inner = service.inner().unwrap();
+        inner.store.get_item("m1").unwrap().unwrap()
+    };
+    assert!(record.locked_fields.iter().any(|field| field == "Overview"));
+    assert!(!record.locked_fields.iter().any(|field| field == "Name"));
+}
+
+#[tokio::test]
+async fn original_title_lock_falls_back_when_the_server_rejects_it() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    fake.reject_locked_field("OriginalTitle");
+    let service = synced_service(&fake).await;
+
+    let report = service
+        .write_back_fields("m1", vec![FieldKind::OriginalTitle])
+        .await
+        .unwrap();
+    assert_eq!(report.written, 1);
+    assert!(report.failed.is_empty());
+
+    let updates = fake.updates();
+    assert_eq!(updates.len(), 2, "one rejected attempt + one retry");
+    let first = updates[0].1["LockedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(first.contains(&"OriginalTitle"));
+    let retry = updates[1].1["LockedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(!retry.contains(&"OriginalTitle"));
+
+    // The session remembers the limitation, so the next write does not retry.
+    service
+        .write_back_fields("m1", vec![FieldKind::Tags])
+        .await
+        .unwrap();
+    let updates = fake.updates();
+    assert_eq!(updates.len(), 3);
+    let last = updates[2].1["LockedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(!last.contains(&"OriginalTitle"));
+    assert!(last.contains(&"Tags"));
+
+    let record = {
+        let inner = service.inner().unwrap();
+        inner.store.get_item("m1").unwrap().unwrap()
+    };
+    assert!(!record
+        .locked_fields
+        .iter()
+        .any(|field| field == "OriginalTitle"));
+    assert_eq!(record.status, store::STATUS_DRAFT);
+}
+
+#[tokio::test]
+async fn empty_field_selection_is_a_noop() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    let service = synced_service(&fake).await;
+    service.install_translator(EchoTranslator::new()).unwrap();
+
+    let report = service
+        .translate_fields("m1", Vec::new(), templates(), settings())
+        .await
+        .unwrap();
+    assert_eq!(report.translated, 0);
+    assert!(service.items("movies").unwrap()[0].status == TranslationStatus::Untranslated);
+
+    let report = service.write_back_fields("m1", Vec::new()).await.unwrap();
+    assert_eq!(report.written, 0);
+    assert!(fake.updates().is_empty());
 }

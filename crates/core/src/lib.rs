@@ -34,17 +34,40 @@ const INCLUDE_ITEM_TYPES: &[&str] = &["Movie", "Series", "Season", "Episode"];
 const SETTING_TEMPLATES: &str = "templates";
 const SETTING_PROVIDER: &str = "provider";
 
-/// `MetadataField` values accepted by Jellyfin 10.11/12 (per the official
-/// OpenAPI-generated SDK). `Cast` is how People are locked; there is no
-/// `People`/`OriginalTitle` member in the current enum.
-const SERVER_LOCKED_FIELDS: &[&str] = &["Name", "Overview", "Tags", "Cast"];
-
 /// Per-item translation state shown in the library grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TranslationStatus {
     Untranslated,
     Draft,
     Written,
+}
+
+/// One metadata field the edit dialog can translate or write back independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FieldKind {
+    Title,
+    OriginalTitle,
+    Overview,
+    Tags,
+    People,
+}
+
+const ALL_FIELDS: [FieldKind; 5] = [
+    FieldKind::Title,
+    FieldKind::OriginalTitle,
+    FieldKind::Overview,
+    FieldKind::Tags,
+    FieldKind::People,
+];
+
+/// The server's original metadata snapshot, unaffected by local drafts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemSource {
+    pub title: String,
+    pub original_title: String,
+    pub overview: String,
+    pub tags: Vec<String>,
+    pub people: Vec<PersonView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +85,7 @@ pub struct ItemView {
     pub id: String,
     pub library_id: String,
     pub item_type: String,
+    /// Effective title: the draft when one exists, otherwise the server source.
     pub title: String,
     pub original_title: String,
     pub overview: String,
@@ -69,6 +93,8 @@ pub struct ItemView {
     pub people: Vec<PersonView>,
     pub status: TranslationStatus,
     pub locked: bool,
+    /// The untouched server snapshot, for the "original" column in the dialog.
+    pub source: ItemSource,
 }
 
 /// User-editable fields from the edit dialog.
@@ -177,6 +203,9 @@ type ClientFactory = dyn Fn(&str, &str) -> Result<Arc<dyn JellyfinApi>> + Send +
 struct Inner {
     store: Store,
     api: Option<Arc<dyn JellyfinApi>>,
+    /// Some Jellyfin builds reject `OriginalTitle` in `LockedFields`; after the
+    /// first rejection we stop sending it for the rest of the session.
+    original_title_lock_supported: bool,
     #[cfg(test)]
     translator: Option<Arc<dyn PromptTranslator>>,
     /// Lets tests exercise `connect` without a real server.
@@ -227,6 +256,7 @@ impl AppService {
             inner: Arc::new(Mutex::new(Inner {
                 store,
                 api: None,
+                original_title_lock_supported: true,
                 #[cfg(test)]
                 translator: None,
                 #[cfg(test)]
@@ -244,6 +274,7 @@ impl AppService {
             inner: Arc::new(Mutex::new(Inner {
                 store: Store::open_in_memory()?,
                 api: None,
+                original_title_lock_supported: true,
                 #[cfg(test)]
                 translator: None,
                 #[cfg(test)]
@@ -603,7 +634,44 @@ impl AppService {
             return Ok(TranslateReport::default());
         }
         let translator = self.translator(&settings)?;
+        self.translate_items(translator.as_ref(), ids, &ALL_FIELDS, &templates, &settings)
+            .await
+    }
 
+    /// Translate only the selected fields of one item into the local draft.
+    ///
+    /// Templates, presets and the OpenAI-compatible provider behave exactly like
+    /// [`Self::translate`]; fields that are not selected are left untouched.
+    pub async fn translate_fields(
+        &self,
+        item_id: &str,
+        fields: Vec<FieldKind>,
+        templates: Templates,
+        settings: ProviderSettings,
+    ) -> Result<TranslateReport> {
+        let fields = normalize_fields(&fields);
+        if fields.is_empty() {
+            return Ok(TranslateReport::default());
+        }
+        let translator = self.translator(&settings)?;
+        self.translate_items(
+            translator.as_ref(),
+            vec![item_id.to_string()],
+            &fields,
+            &templates,
+            &settings,
+        )
+        .await
+    }
+
+    async fn translate_items(
+        &self,
+        translator: &dyn PromptTranslator,
+        ids: Vec<String>,
+        fields: &[FieldKind],
+        templates: &Templates,
+        settings: &ProviderSettings,
+    ) -> Result<TranslateReport> {
         let mut failed = Vec::new();
         let mut items = Vec::new();
         let presets = {
@@ -632,20 +700,19 @@ impl AppService {
                 tracing::debug!(item = %item.id, "skip locked item");
                 continue;
             }
-            match translate_item(
-                translator.as_ref(),
-                &item,
-                &templates,
-                &settings,
-                &preset_map,
-            )
-            .await
+            match translate_item(translator, &item, fields, templates, settings, &preset_map).await
             {
                 Ok(outcome) => {
                     {
                         let mut inner = self.inner()?;
                         inner.store.save_draft(&item.id, &outcome.draft)?;
-                        record_translations(&mut inner.store, &item, &outcome.draft, &settings)?;
+                        record_translations(
+                            &mut inner.store,
+                            &item,
+                            &outcome.draft,
+                            settings,
+                            fields,
+                        )?;
                     }
                     used_presets.extend(outcome.preset_sources);
                     report.translated += 1;
@@ -665,36 +732,70 @@ impl AppService {
     }
 
     pub async fn write_back(&self, ids: Vec<String>) -> Result<WriteReport> {
-        let api = self.api()?;
         let mut report = WriteReport::default();
-
         for id in ids {
-            let item = {
-                let inner = self.inner()?;
-                inner.store.get_item(&id)?
-            };
-            let Some(item) = item else {
-                report.failed.push((id, "本地库中不存在该条目".to_string()));
-                continue;
-            };
-            if item.locked {
-                tracing::debug!(item = %item.id, "skip locked item");
-                continue;
+            let one = self.write_back_fields(&id, ALL_FIELDS.to_vec()).await?;
+            if one.written > 0 {
+                // Only a successful full-field write marks the item written; the
+                // per-field writer itself always leaves it in Draft state.
+                let mut inner = self.inner()?;
+                inner.store.set_status(&id, store::STATUS_WRITTEN)?;
             }
-
-            match write_item(api.as_ref(), &item).await {
-                Ok(locked_fields) => {
-                    let mut inner = self.inner()?;
-                    inner.store.mark_written(&item.id, &locked_fields)?;
-                    report.written += 1;
-                }
-                Err(error) => {
-                    tracing::warn!(item = %item.id, error = %error, "write-back failed");
-                    report.failed.push((item.id.clone(), format!("{error:#}")));
-                }
-            }
+            report.written += one.written;
+            report.failed.extend(one.failed);
         }
         Ok(report)
+    }
+
+    /// Write only the selected fields of one item back to Jellyfin.
+    ///
+    /// Reads the full DTO, changes only the selected fields (plus their lock
+    /// flags), posts it and verifies each written field by reading it back. The
+    /// item stays a Draft; only [`Self::write_back`] promotes it to Written.
+    pub async fn write_back_fields(
+        &self,
+        item_id: &str,
+        fields: Vec<FieldKind>,
+    ) -> Result<WriteReport> {
+        let api = self.api()?;
+        let fields = normalize_fields(&fields);
+        if fields.is_empty() {
+            return Ok(WriteReport::default());
+        }
+        let item = {
+            let inner = self.inner()?;
+            inner.store.get_item(item_id)?
+        };
+        let Some(item) = item else {
+            return Ok(WriteReport {
+                written: 0,
+                failed: vec![(item_id.to_string(), "本地库中不存在该条目".to_string())],
+            });
+        };
+        if item.locked {
+            tracing::debug!(item = %item.id, "skip locked item");
+            return Ok(WriteReport::default());
+        }
+
+        match self.write_item_fields(api.as_ref(), &item, &fields).await {
+            Ok(locked_fields) => {
+                let mut inner = self.inner()?;
+                inner
+                    .store
+                    .mark_draft_with_locks(&item.id, &locked_fields)?;
+                Ok(WriteReport {
+                    written: 1,
+                    failed: Vec::new(),
+                })
+            }
+            Err(error) => {
+                tracing::warn!(item = %item.id, error = %error, "write-back failed");
+                Ok(WriteReport {
+                    written: 0,
+                    failed: vec![(item.id.clone(), format!("{error:#}"))],
+                })
+            }
+        }
     }
 
     /// Raw bytes of an item's `Primary` image (poster/thumb), scaled to
@@ -911,15 +1012,14 @@ fn item_view(record: ItemRecord) -> ItemView {
     let original_title = record.effective_original_title().to_string();
     let overview = record.effective_overview().to_string();
     let tags = record.effective_tags().to_vec();
-    let people = record
-        .effective_people()
-        .iter()
-        .map(|person| PersonView {
-            id: person.id.clone(),
-            name: person.name.clone(),
-            role: person.role.clone(),
-        })
-        .collect();
+    let people = record.effective_people().iter().map(person_view).collect();
+    let source = ItemSource {
+        title: record.name.clone().unwrap_or_default(),
+        original_title: record.original_title.clone().unwrap_or_default(),
+        overview: record.overview.clone().unwrap_or_default(),
+        tags: record.tags.clone(),
+        people: record.people.iter().map(person_view).collect(),
+    };
     ItemView {
         id: record.id,
         library_id: record.library_id,
@@ -931,6 +1031,15 @@ fn item_view(record: ItemRecord) -> ItemView {
         people,
         status: parse_status(&record.status),
         locked: record.locked,
+        source,
+    }
+}
+
+fn person_view(person: &PersonRecord) -> PersonView {
+    PersonView {
+        id: person.id.clone(),
+        name: person.name.clone(),
+        role: person.role.clone(),
     }
 }
 
@@ -994,101 +1103,103 @@ struct TranslateOutcome {
 async fn translate_item(
     translator: &dyn PromptTranslator,
     item: &ItemRecord,
+    fields: &[FieldKind],
     templates: &Templates,
     settings: &ProviderSettings,
     presets: &HashMap<String, String>,
 ) -> Result<TranslateOutcome> {
-    let source_name = source_text(&item.name, &item.draft_name);
-    let source_original = source_text(&item.original_title, &item.draft_original_title);
-    let source_overview = source_text(&item.overview, &item.draft_overview);
-    let source_tags = item.tags.clone();
-    let source_people = item.people.clone();
+    // Start from the current effective values so fields that are not selected
+    // keep whatever draft (or source text) they already had.
+    let mut draft = ItemDraft {
+        name: item.effective_name().to_string(),
+        original_title: item.effective_original_title().to_string(),
+        overview: item.effective_overview().to_string(),
+        tags: item.effective_tags().to_vec(),
+        people: item.effective_people().to_vec(),
+    };
+    let mut preset_sources = Vec::new();
 
-    // Title + original title share the "title" template.
-    let mut title_segments = Vec::new();
-    if !source_name.trim().is_empty() {
-        title_segments.push(Segment {
-            id: "name".to_string(),
-            text: source_name.clone(),
-        });
-    }
-    if !source_original.trim().is_empty() && source_original != source_name {
-        title_segments.push(Segment {
-            id: "original_title".to_string(),
-            text: source_original.clone(),
-        });
-    }
-    let title_translations = if title_segments.is_empty() {
-        HashMap::new()
-    } else {
-        let instruction = render_template(
-            &templates.title,
-            &source_name,
-            &title_segments,
-            settings,
-            "title",
-        );
-        call_segments(translator, &title_segments, instruction, settings)
+    if fields.contains(&FieldKind::Title) {
+        let source = source_text(&item.name, &item.draft_name);
+        draft.name = translate_single(translator, &source, &templates.title, settings, "title")
             .await
-            .context("翻译标题失败")?
-    };
+            .context("翻译标题失败")?;
+    }
 
-    let draft_name = if source_name.trim().is_empty() {
-        source_name.clone()
-    } else {
-        title_translations
-            .get("name")
-            .cloned()
-            .unwrap_or_else(|| source_name.clone())
-    };
-    let draft_original_title = if source_original.trim().is_empty() {
-        String::new()
-    } else if source_original == source_name {
-        draft_name.clone()
-    } else {
-        title_translations
-            .get("original_title")
-            .cloned()
-            .unwrap_or_else(|| source_original.clone())
-    };
+    if fields.contains(&FieldKind::OriginalTitle) {
+        let source = source_text(&item.original_title, &item.draft_original_title);
+        draft.original_title = translate_single(
+            translator,
+            &source,
+            &templates.title,
+            settings,
+            "original_title",
+        )
+        .await
+        .context("翻译原名失败")?;
+    }
 
-    let draft_overview = if source_overview.trim().is_empty() {
-        source_overview.clone()
-    } else {
-        let segments = vec![Segment {
-            id: "overview".to_string(),
-            text: source_overview.clone(),
-        }];
-        let instruction = render_template(
+    if fields.contains(&FieldKind::Overview) {
+        let source = source_text(&item.overview, &item.draft_overview);
+        draft.overview = translate_single(
+            translator,
+            &source,
             &templates.overview,
-            &source_overview,
-            &segments,
             settings,
             "overview",
-        );
-        let translations = call_segments(translator, &segments, instruction, settings)
-            .await
-            .context("翻译简介失败")?;
-        translations
-            .get("overview")
-            .cloned()
-            .unwrap_or_else(|| source_overview.clone())
-    };
+        )
+        .await
+        .context("翻译简介失败")?;
+    }
 
-    let draft_tags = translate_tags(translator, &source_tags, templates, settings).await?;
+    if fields.contains(&FieldKind::Tags) {
+        let source_tags = if item.tags.is_empty() {
+            item.effective_tags().to_vec()
+        } else {
+            item.tags.clone()
+        };
+        draft.tags = translate_tags(translator, &source_tags, templates, settings).await?;
+    }
 
-    let people = translate_people(translator, &source_people, templates, settings, presets).await?;
+    if fields.contains(&FieldKind::People) {
+        let source_people = if item.people.is_empty() {
+            item.effective_people().to_vec()
+        } else {
+            item.people.clone()
+        };
+        let people =
+            translate_people(translator, &source_people, templates, settings, presets).await?;
+        draft.people = people.people;
+        preset_sources = people.preset_sources;
+    }
 
     Ok(TranslateOutcome {
-        draft: ItemDraft {
-            name: draft_name,
-            original_title: draft_original_title,
-            overview: draft_overview,
-            tags: draft_tags,
-            people: people.people,
-        },
-        preset_sources: people.preset_sources,
+        draft,
+        preset_sources,
     })
+}
+
+/// Translate one text field, or pass an empty source through unchanged.
+async fn translate_single(
+    translator: &dyn PromptTranslator,
+    source: &str,
+    template: &str,
+    settings: &ProviderSettings,
+    field: &str,
+) -> Result<String> {
+    if source.trim().is_empty() {
+        return Ok(source.to_string());
+    }
+    let segments = vec![Segment {
+        id: field.to_string(),
+        text: source.to_string(),
+    }];
+    let instruction = render_template(template, source, &segments, settings, field);
+    let translations = call_segments(translator, &segments, instruction, settings).await?;
+    Ok(translations
+        .get(field)
+        .cloned()
+        .unwrap_or_else(|| source.to_string()))
 }
 
 struct TranslatedPeople {
@@ -1309,19 +1420,20 @@ fn record_translations(
     item: &ItemRecord,
     draft: &ItemDraft,
     settings: &ProviderSettings,
+    fields: &[FieldKind],
 ) -> Result<()> {
     let now = store::now_unix();
-    let fields = [
-        ("name", draft.name.clone()),
-        ("original_title", draft.original_title.clone()),
-        ("overview", draft.overview.clone()),
-        ("tags", serde_json::to_string(&draft.tags)?),
-        ("people", serde_json::to_string(&draft.people)?),
-    ];
-    for (field, text) in fields {
+    for field in fields {
+        let (name, text) = match field {
+            FieldKind::Title => ("name", draft.name.clone()),
+            FieldKind::OriginalTitle => ("original_title", draft.original_title.clone()),
+            FieldKind::Overview => ("overview", draft.overview.clone()),
+            FieldKind::Tags => ("tags", serde_json::to_string(&draft.tags)?),
+            FieldKind::People => ("people", serde_json::to_string(&draft.people)?),
+        };
         store.upsert_translation(&TranslationRecord {
             item_id: item.id.clone(),
-            field: field.to_string(),
+            field: name.to_string(),
             lang: settings.target_lang.clone(),
             source_hash: item.source_hash.clone(),
             text,
@@ -1338,44 +1450,135 @@ fn record_translations(
 // Write-back
 // ---------------------------------------------------------------------------
 
-async fn write_item(api: &dyn JellyfinApi, item: &ItemRecord) -> Result<Vec<String>> {
-    let mut dto = api
-        .item(&item.id)
-        .await
-        .with_context(|| format!("读取条目 {} 完整 DTO 失败", item.id))?;
-    let object = dto
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("条目 {} 的 DTO 不是 JSON 对象", item.id))?;
+#[derive(Debug, Default)]
+struct ExpectedWrite {
+    name: Option<String>,
+    original_title: Option<String>,
+    overview: Option<String>,
+    tags: Option<Vec<String>>,
+    people: Option<Vec<PersonRecord>>,
+}
 
-    let name = item.effective_name().trim().to_string();
-    anyhow::ensure!(!name.is_empty(), "标题为空，拒绝写回");
-    let original_title = effective_option(&item.draft_original_title, &item.original_title);
-    let overview = effective_option(&item.draft_overview, &item.overview);
-    let tags = item.effective_tags().to_vec();
-    let people = item.effective_people().to_vec();
-
-    object.insert("Name".to_string(), json!(name));
-    if let Some(value) = original_title {
-        object.insert("OriginalTitle".to_string(), json!(value));
+fn locked_field_name(field: FieldKind) -> &'static str {
+    match field {
+        FieldKind::Title => "Name",
+        FieldKind::OriginalTitle => "OriginalTitle",
+        FieldKind::Overview => "Overview",
+        FieldKind::Tags => "Tags",
+        FieldKind::People => "Cast",
     }
-    if let Some(value) = overview {
-        object.insert("Overview".to_string(), json!(value));
+}
+
+fn normalize_fields(fields: &[FieldKind]) -> Vec<FieldKind> {
+    let mut out = Vec::with_capacity(fields.len());
+    for field in fields {
+        if !out.contains(field) {
+            out.push(*field);
+        }
     }
-    object.insert("Tags".to_string(), json!(tags));
-    object.insert(
-        "People".to_string(),
-        Value::Array(merge_people_json(object.get("People"), &people)),
-    );
+    out
+}
 
-    let locked_fields = merge_locked_fields(object.get("LockedFields"));
-    object.insert("LockedFields".to_string(), json!(locked_fields));
+impl AppService {
+    /// GET the full DTO, patch only the selected fields (+ their lock flags),
+    /// POST it back and verify the selected fields by reading the item again.
+    async fn write_item_fields(
+        &self,
+        api: &dyn JellyfinApi,
+        item: &ItemRecord,
+        fields: &[FieldKind],
+    ) -> Result<Vec<String>> {
+        let mut dto = api
+            .item(&item.id)
+            .await
+            .with_context(|| format!("读取条目 {} 完整 DTO 失败", item.id))?;
+        let mut expected = ExpectedWrite::default();
+        let mut locked_fields;
 
-    api.update_item(&item.id, &dto)
-        .await
-        .with_context(|| format!("写回条目 {} 失败", item.id))?;
+        {
+            let object = dto
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("条目 {} 的 DTO 不是 JSON 对象", item.id))?;
 
-    verify_written(api, item, &name, original_title, overview, &tags, &people).await?;
-    Ok(locked_fields)
+            if fields.contains(&FieldKind::Title) {
+                let name = item.effective_name().trim().to_string();
+                anyhow::ensure!(!name.is_empty(), "标题为空，拒绝写回");
+                object.insert("Name".to_string(), json!(name));
+                expected.name = Some(name);
+            }
+            if fields.contains(&FieldKind::OriginalTitle) {
+                if let Some(value) =
+                    effective_option(&item.draft_original_title, &item.original_title)
+                {
+                    object.insert("OriginalTitle".to_string(), json!(value));
+                    expected.original_title = Some(value.to_string());
+                }
+            }
+            if fields.contains(&FieldKind::Overview) {
+                if let Some(value) = effective_option(&item.draft_overview, &item.overview) {
+                    object.insert("Overview".to_string(), json!(value));
+                    expected.overview = Some(value.to_string());
+                }
+            }
+            if fields.contains(&FieldKind::Tags) {
+                let tags = item.effective_tags().to_vec();
+                object.insert("Tags".to_string(), json!(tags));
+                expected.tags = Some(tags);
+            }
+            if fields.contains(&FieldKind::People) {
+                let people = item.effective_people().to_vec();
+                object.insert(
+                    "People".to_string(),
+                    Value::Array(merge_people_json(object.get("People"), &people)),
+                );
+                expected.people = Some(people);
+            }
+
+            let original_title_lock_supported = self.inner()?.original_title_lock_supported;
+            let desired_locks = fields
+                .iter()
+                .map(|field| locked_field_name(*field))
+                .filter(|name| *name != "OriginalTitle" || original_title_lock_supported)
+                .collect::<Vec<_>>();
+            locked_fields = merge_locked_fields(object.get("LockedFields"), &desired_locks);
+            object.insert("LockedFields".to_string(), json!(locked_fields));
+        }
+
+        match api.update_item(&item.id, &dto).await {
+            Ok(()) => {}
+            Err(first_error) if locked_fields.iter().any(|field| field == "OriginalTitle") => {
+                // The official MetadataField enum has no OriginalTitle (only
+                // Name/Overview/Tags/Cast/...). Some servers reject the whole
+                // DTO; retry without that one lock and remember the limitation.
+                tracing::warn!(
+                    item = %item.id,
+                    error = %first_error,
+                    "Jellyfin rejected LockedFields OriginalTitle; retrying without it"
+                );
+                locked_fields.retain(|field| field != "OriginalTitle");
+                {
+                    let object = dto
+                        .as_object_mut()
+                        .ok_or_else(|| anyhow!("条目 {} 的 DTO 不是 JSON 对象", item.id))?;
+                    object.insert("LockedFields".to_string(), json!(locked_fields));
+                }
+                api.update_item(&item.id, &dto).await.with_context(|| {
+                    format!(
+                        "写回条目 {} 失败（已去掉不支持的 OriginalTitle 锁定后重试）",
+                        item.id
+                    )
+                })?;
+                let mut inner = self.inner()?;
+                inner.original_title_lock_supported = false;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("写回条目 {} 失败", item.id));
+            }
+        }
+
+        verify_written(api, item, &expected).await?;
+        Ok(locked_fields)
+    }
 }
 
 fn effective_option<'a>(draft: &'a Option<String>, source: &'a Option<String>) -> Option<&'a str> {
@@ -1433,7 +1636,7 @@ fn merge_people_json(existing: Option<&Value>, people: &[PersonRecord]) -> Vec<V
         .collect()
 }
 
-fn merge_locked_fields(existing: Option<&Value>) -> Vec<String> {
+fn merge_locked_fields(existing: Option<&Value>, desired: &[&str]) -> Vec<String> {
     let mut fields = existing
         .and_then(Value::as_array)
         .map(|values| {
@@ -1443,35 +1646,32 @@ fn merge_locked_fields(existing: Option<&Value>) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    for field in SERVER_LOCKED_FIELDS {
+    for field in desired {
         if !fields.iter().any(|value| value.eq_ignore_ascii_case(field)) {
             fields.push((*field).to_string());
         }
     }
     fields
 }
-
 async fn verify_written(
     api: &dyn JellyfinApi,
     item: &ItemRecord,
-    expected_name: &str,
-    expected_original_title: Option<&str>,
-    expected_overview: Option<&str>,
-    expected_tags: &[String],
-    expected_people: &[PersonRecord],
+    expected: &ExpectedWrite,
 ) -> Result<()> {
     let after = api
         .item(&item.id)
         .await
         .with_context(|| format!("读回条目 {} 失败", item.id))?;
 
-    let actual_name = after.get("Name").and_then(Value::as_str).unwrap_or("");
-    anyhow::ensure!(
-        actual_name == expected_name,
-        "读回校验失败：Name 期望 {expected_name:?}，实际 {actual_name:?}"
-    );
+    if let Some(expected_name) = &expected.name {
+        let actual_name = after.get("Name").and_then(Value::as_str).unwrap_or("");
+        anyhow::ensure!(
+            actual_name == expected_name,
+            "读回校验失败：Name 期望 {expected_name:?}，实际 {actual_name:?}"
+        );
+    }
 
-    if let Some(expected) = expected_original_title {
+    if let Some(expected) = &expected.original_title {
         let actual = after
             .get("OriginalTitle")
             .and_then(Value::as_str)
@@ -1482,7 +1682,7 @@ async fn verify_written(
         );
     }
 
-    if let Some(expected) = expected_overview {
+    if let Some(expected) = &expected.overview {
         let actual = after.get("Overview").and_then(Value::as_str).unwrap_or("");
         anyhow::ensure!(
             actual == expected,
@@ -1490,51 +1690,55 @@ async fn verify_written(
         );
     }
 
-    let actual_tags = after
-        .get("Tags")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    anyhow::ensure!(
-        actual_tags == expected_tags,
-        "读回校验失败：Tags 期望 {expected_tags:?}，实际 {actual_tags:?}"
-    );
+    if let Some(expected_tags) = &expected.tags {
+        let actual_tags = after
+            .get("Tags")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        anyhow::ensure!(
+            actual_tags == *expected_tags,
+            "读回校验失败：Tags 期望 {expected_tags:?}，实际 {actual_tags:?}"
+        );
+    }
 
-    let actual_people = after
-        .get("People")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| {
-                    (
-                        value
-                            .get("Name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        value
-                            .get("Role")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let expected = expected_people
-        .iter()
-        .map(|person| (person.name.clone(), person.role.clone()))
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        actual_people == expected,
-        "读回校验失败：People 期望 {expected:?}，实际 {actual_people:?}"
-    );
+    if let Some(expected_people) = &expected.people {
+        let actual_people = after
+            .get("People")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        (
+                            value
+                                .get("Name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            value
+                                .get("Role")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let expected = expected_people
+            .iter()
+            .map(|person| (person.name.clone(), person.role.clone()))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            actual_people == expected,
+            "读回校验失败：People 期望 {expected:?}，实际 {actual_people:?}"
+        );
+    }
 
     Ok(())
 }

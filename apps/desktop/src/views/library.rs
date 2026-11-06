@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ::core::{ItemEdit, ItemView, LibraryView, PersonView, TranslationStatus};
+use ::core::{ItemView, LibraryView, TranslationStatus};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::component::switch::Switch;
@@ -14,6 +14,7 @@ use gpui_kit::*;
 use crate::app::{AppState, Page};
 use crate::covers;
 use crate::ui;
+use crate::views::edit_dialog::EditSource;
 
 /// Status filter chips above the poster grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,15 +48,17 @@ pub(crate) struct LibraryState {
     pub(crate) selected: HashSet<String>,
     pub(crate) drawer: Option<String>,
     pub(crate) editing: Option<String>,
-    pub(crate) edit_saving: bool,
+    pub(crate) edit_busy: bool,
+    pub(crate) edit_error: Option<SharedString>,
+    pub(crate) edit_source: EditSource,
     pub(crate) loading_libraries: bool,
     pub(crate) loading_items: bool,
     pub(crate) error: Option<SharedString>,
     pub(crate) search: Entity<InputState>,
-    pub(crate) edit_title: Entity<InputState>,
-    pub(crate) edit_orig: Entity<InputState>,
+    pub(crate) edit_title: Entity<TextareaState>,
+    pub(crate) edit_orig: Entity<TextareaState>,
     pub(crate) edit_overview: Entity<TextareaState>,
-    pub(crate) edit_tags: Entity<InputState>,
+    pub(crate) edit_tags: Entity<TextareaState>,
     pub(crate) edit_people: Entity<TextareaState>,
 }
 
@@ -70,15 +73,17 @@ impl LibraryState {
             selected: HashSet::new(),
             drawer: None,
             editing: None,
-            edit_saving: false,
+            edit_busy: false,
+            edit_error: None,
+            edit_source: EditSource::default(),
             loading_libraries: false,
             loading_items: false,
             error: None,
             search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索标题、演员、标签…")),
-            edit_title: cx.new(|cx| InputState::new(window, cx)),
-            edit_orig: cx.new(|cx| InputState::new(window, cx)),
+            edit_title: cx.new(|cx| TextareaState::new(window, cx)),
+            edit_orig: cx.new(|cx| TextareaState::new(window, cx)),
             edit_overview: cx.new(|cx| TextareaState::new(window, cx)),
-            edit_tags: cx.new(|cx| InputState::new(window, cx)),
+            edit_tags: cx.new(|cx| TextareaState::new(window, cx)),
             edit_people: cx.new(|cx| TextareaState::new(window, cx)),
         }
     }
@@ -319,6 +324,9 @@ impl AppState {
             .join("\n");
 
         self.library.editing = Some(item_id);
+        self.library.edit_source = EditSource::from_item(&item);
+        self.library.edit_busy = false;
+        self.library.edit_error = None;
         self.library.edit_title.update(cx, |state, cx| {
             state.set_value(item.title.clone(), window, cx)
         });
@@ -335,128 +343,6 @@ impl AppState {
             .edit_people
             .update(cx, |state, cx| state.set_value(people, window, cx));
         cx.notify();
-    }
-
-    /// Persist the edit dialog. When `write_after` is set the saved draft is
-    /// immediately written back to Jellyfin in the same background job.
-    pub(crate) fn save_edit(
-        &mut self,
-        write_after: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(item_id) = self.library.editing.clone() else {
-            return;
-        };
-        if self.library.edit_saving {
-            return;
-        }
-
-        let title = self.library.edit_title.read(cx).value().to_string();
-        let original_title = self.library.edit_orig.read(cx).value().to_string();
-        let overview = self.library.edit_overview.read(cx).value().to_string();
-        let tags = self
-            .library
-            .edit_tags
-            .read(cx)
-            .value()
-            .to_string()
-            .split(|c| c == ',' || c == '，')
-            .map(str::trim)
-            .filter(|tag| !tag.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let people = self
-            .library
-            .edit_people
-            .read(cx)
-            .value()
-            .to_string()
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                if line.is_empty() {
-                    return None;
-                }
-                let (name, role) = line
-                    .split_once(" / ")
-                    .or_else(|| line.split_once('/'))
-                    .or_else(|| line.split_once('／'))
-                    .map(|(name, role)| (name.trim(), role.trim()))
-                    .unwrap_or((line, ""));
-                if name.is_empty() {
-                    return None;
-                }
-                Some(PersonView {
-                    id: None,
-                    name: name.to_string(),
-                    role: if role.is_empty() {
-                        None
-                    } else {
-                        Some(role.to_string())
-                    },
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let edit = ItemEdit {
-            title: if title.trim().is_empty() {
-                "未命名".to_string()
-            } else {
-                title.trim().to_string()
-            },
-            original_title,
-            overview,
-            tags,
-            people,
-        };
-
-        self.library.edit_saving = true;
-        cx.notify();
-
-        let id_for_job = item_id.clone();
-        self.spawn_async_job_in(
-            window,
-            cx,
-            move |service| {
-                Box::pin(async move {
-                    service
-                        .save_draft(&id_for_job, edit)
-                        .map_err(ui::error_text)?;
-                    if write_after {
-                        let report = service
-                            .write_back(vec![id_for_job])
-                            .await
-                            .map_err(ui::error_text)?;
-                        Ok((report.written, report.failed.len()))
-                    } else {
-                        Ok((0usize, 0usize))
-                    }
-                })
-            },
-            move |this, result, _window, cx| {
-                this.library.edit_saving = false;
-                match result {
-                    Ok((written, failed)) => {
-                        this.library.editing = None;
-                        this.reload_active(cx);
-                        if write_after {
-                            let message = if failed == 0 {
-                                format!("已保存并写回 {written} 条")
-                            } else {
-                                format!("已写回 {written} 条，失败 {failed} 条")
-                            };
-                            this.record_task("写回", message.clone(), failed == 0, cx);
-                            this.notify_toast(message, cx);
-                        } else {
-                            this.notify_toast("已保存草稿", cx);
-                        }
-                    }
-                    Err(message) => this.notify_toast(message, cx),
-                }
-                cx.notify();
-            },
-        );
     }
 
     // --------------------------------------------------------------- actions
