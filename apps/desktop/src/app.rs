@@ -922,11 +922,25 @@ impl AppState {
                                 .into_any_element()
                         });
 
+                    let has_role = person
+                        .role
+                        .as_deref()
+                        .map(|role| !role.trim().is_empty())
+                        .unwrap_or(false);
+
                     h_flex()
                         .w_full()
                         .min_w_0()
                         .gap_2()
-                        .items_start()
+                        // With a role the block has two lines and should align to
+                        // the top of the avatar; a name-only block is centered.
+                        .map(|row| {
+                            if has_role {
+                                row.items_start()
+                            } else {
+                                row.items_center()
+                            }
+                        })
                         .child(avatar)
                         .child(
                             v_flex()
@@ -942,17 +956,20 @@ impl AppState {
                                         .whitespace_normal()
                                         .child(person.name.clone()),
                                 )
-                                .when_some(person.role.clone(), |column, role| {
-                                    column.child(
-                                        div()
-                                            .w_full()
-                                            .min_w_0()
-                                            .text_size(px(10.5))
-                                            .text_color(ui::muted(theme))
-                                            .whitespace_normal()
-                                            .child(role),
-                                    )
-                                }),
+                                .when_some(
+                                    person.role.clone().filter(|role| !role.trim().is_empty()),
+                                    |column, role| {
+                                        column.child(
+                                            div()
+                                                .w_full()
+                                                .min_w_0()
+                                                .text_size(px(10.5))
+                                                .text_color(ui::muted(theme))
+                                                .whitespace_normal()
+                                                .child(role),
+                                        )
+                                    },
+                                ),
                         )
                 }))
                 .into_any_element()
