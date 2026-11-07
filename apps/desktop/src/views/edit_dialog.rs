@@ -17,16 +17,21 @@ use crate::views::settings::fill_default_templates;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EditField {
     Title,
+    SortName,
     OriginalTitle,
+    Genres,
     Overview,
     Tags,
     People,
 }
 
 impl EditField {
-    pub(crate) const ALL: [EditField; 5] = [
+    /// Display order in the main dialog: 标题、排序标题、原名、类型、简介、标签、演职员。
+    pub(crate) const ALL: [EditField; 7] = [
         EditField::Title,
+        EditField::SortName,
         EditField::OriginalTitle,
+        EditField::Genres,
         EditField::Overview,
         EditField::Tags,
         EditField::People,
@@ -35,7 +40,9 @@ impl EditField {
     pub(crate) fn label(self) -> &'static str {
         match self {
             EditField::Title => "标题",
+            EditField::SortName => "排序标题",
             EditField::OriginalTitle => "原名",
+            EditField::Genres => "类型",
             EditField::Overview => "简介",
             EditField::Tags => "标签",
             EditField::People => "演职员",
@@ -45,7 +52,9 @@ impl EditField {
     fn kind(self) -> FieldKind {
         match self {
             EditField::Title => FieldKind::Title,
+            EditField::SortName => FieldKind::SortName,
             EditField::OriginalTitle => FieldKind::OriginalTitle,
+            EditField::Genres => FieldKind::Genres,
             EditField::Overview => FieldKind::Overview,
             EditField::Tags => FieldKind::Tags,
             EditField::People => FieldKind::People,
@@ -57,7 +66,9 @@ impl EditField {
 #[derive(Clone, Default)]
 pub(crate) struct EditSource {
     pub(crate) title: String,
+    pub(crate) sort_name: String,
     pub(crate) original_title: String,
+    pub(crate) genres: Vec<String>,
     pub(crate) overview: String,
     pub(crate) tags: Vec<String>,
     pub(crate) people: Vec<PersonView>,
@@ -67,7 +78,9 @@ impl EditSource {
     pub(crate) fn from_item(item: &ItemView) -> Self {
         Self {
             title: item.source.title.clone(),
+            sort_name: item.source.sort_name.clone(),
             original_title: item.source.original_title.clone(),
+            genres: item.source.genres.clone(),
             overview: item.source.overview.clone(),
             tags: item.source.tags.clone(),
             people: item.source.people.clone(),
@@ -77,7 +90,15 @@ impl EditSource {
     fn text(&self, field: EditField) -> String {
         match field {
             EditField::Title => self.title.clone(),
+            EditField::SortName => self.sort_name.clone(),
             EditField::OriginalTitle => self.original_title.clone(),
+            EditField::Genres => {
+                if self.genres.is_empty() {
+                    "—".to_string()
+                } else {
+                    self.genres.join(", ")
+                }
+            }
             EditField::Overview => self.overview.clone(),
             EditField::Tags => {
                 if self.tags.is_empty() {
@@ -124,6 +145,9 @@ pub(crate) enum FieldEditorState {
     Tags {
         rows: Vec<TagRow>,
     },
+    Genres {
+        rows: Vec<TagRow>,
+    },
     People {
         rows: Vec<PersonEditRow>,
     },
@@ -134,6 +158,7 @@ impl FieldEditorState {
         match self {
             FieldEditorState::Text { field, .. } => *field,
             FieldEditorState::Tags { .. } => EditField::Tags,
+            FieldEditorState::Genres { .. } => EditField::Genres,
             FieldEditorState::People { .. } => EditField::People,
         }
     }
@@ -146,7 +171,15 @@ impl FieldEditorState {
 fn effective_text(item: &ItemView, field: EditField) -> String {
     match field {
         EditField::Title => item.title.clone(),
+        EditField::SortName => item.sort_name.clone(),
         EditField::OriginalTitle => item.original_title.clone(),
+        EditField::Genres => {
+            if item.genres.is_empty() {
+                "—".to_string()
+            } else {
+                item.genres.join(", ")
+            }
+        }
         EditField::Overview => item.overview.clone(),
         EditField::Tags => {
             if item.tags.is_empty() {
@@ -579,7 +612,7 @@ impl AppState {
         match editor {
             FieldEditorState::Text { field, input } => {
                 let input_height = match field {
-                    EditField::Title | EditField::OriginalTitle => px(60.),
+                    EditField::Title | EditField::SortName | EditField::OriginalTitle => px(60.),
                     EditField::Overview => px(160.),
                     _ => px(120.),
                 };
@@ -634,7 +667,7 @@ impl AppState {
                         ),
                 );
             }
-            FieldEditorState::Tags { rows } => {
+            FieldEditorState::Tags { rows } | FieldEditorState::Genres { rows } => {
                 body = body.child(
                     h_flex()
                         .w_full()
@@ -822,6 +855,16 @@ impl AppState {
                     input: self.library.edit_title.clone(),
                 });
             }
+            EditField::SortName => {
+                let value = item.sort_name.clone();
+                self.library
+                    .edit_sort_name
+                    .update(cx, |state, cx| state.set_value(value, window, cx));
+                self.library.field_editor = Some(FieldEditorState::Text {
+                    field,
+                    input: self.library.edit_sort_name.clone(),
+                });
+            }
             EditField::OriginalTitle => {
                 let value = item.original_title.clone();
                 self.library
@@ -845,6 +888,10 @@ impl AppState {
             EditField::Tags => {
                 let rows = build_tag_rows(&item, window, cx);
                 self.library.field_editor = Some(FieldEditorState::Tags { rows });
+            }
+            EditField::Genres => {
+                let rows = build_tag_rows_from(&item.source.genres, &item.genres, window, cx);
+                self.library.field_editor = Some(FieldEditorState::Genres { rows });
             }
             EditField::People => {
                 let rows = build_people_rows(&item, window, cx);
@@ -874,6 +921,12 @@ impl AppState {
                         .edit_title
                         .update(cx, |state, cx| state.set_value(value, window, cx));
                 }
+                EditField::SortName => {
+                    let value = item.sort_name.clone();
+                    self.library
+                        .edit_sort_name
+                        .update(cx, |state, cx| state.set_value(value, window, cx));
+                }
                 EditField::OriginalTitle => {
                     let value = item.original_title.clone();
                     self.library
@@ -886,7 +939,7 @@ impl AppState {
                         .edit_overview
                         .update(cx, |state, cx| state.set_value(value, window, cx));
                 }
-                EditField::Tags | EditField::People => {}
+                EditField::Genres | EditField::Tags | EditField::People => {}
             }
         }
         self.library.field_editor = None;
@@ -918,13 +971,16 @@ impl AppState {
         let title = self.library.edit_title.read(cx).value().to_string();
         let original_title = self.library.edit_orig.read(cx).value().to_string();
         let overview = self.library.edit_overview.read(cx).value().to_string();
+        let sort_name = self.library.edit_sort_name.read(cx).value().to_string();
         ItemEdit {
             title: if title.trim().is_empty() {
                 "未命名".to_string()
             } else {
                 title.trim().to_string()
             },
+            sort_name,
             original_title,
+            genres: self.library.edit_genres.clone(),
             overview,
             tags: self.library.edit_tags.clone(),
             people: self.library.edit_people.clone(),
@@ -950,6 +1006,7 @@ impl AppState {
         }
         self.library.edit_source = EditSource::from_item(&item);
         self.library.edit_tags = item.tags.clone();
+        self.library.edit_genres = item.genres.clone();
         self.library.edit_people = item.people.clone();
 
         // Only overwrite the field(s) the operation touched; unsaved text in
@@ -959,6 +1016,12 @@ impl AppState {
             self.library
                 .edit_title
                 .update(cx, |state, cx| state.set_value(title, window, cx));
+        }
+        if applied.contains(&EditField::SortName) {
+            let sort_name = item.sort_name.clone();
+            self.library
+                .edit_sort_name
+                .update(cx, |state, cx| state.set_value(sort_name, window, cx));
         }
         if applied.contains(&EditField::OriginalTitle) {
             let original_title = item.original_title.clone();
@@ -996,10 +1059,21 @@ impl AppState {
             return;
         }
         match field {
-            EditField::Title | EditField::OriginalTitle | EditField::Overview => {}
+            EditField::Title
+            | EditField::SortName
+            | EditField::OriginalTitle
+            | EditField::Overview => {}
             EditField::Tags => {
                 let rows = build_tag_rows(item, window, cx);
                 if let Some(FieldEditorState::Tags { rows: slot }) =
+                    self.library.field_editor.as_mut()
+                {
+                    *slot = rows;
+                }
+            }
+            EditField::Genres => {
+                let rows = build_tag_rows_from(&item.source.genres, &item.genres, window, cx);
+                if let Some(FieldEditorState::Genres { rows: slot }) =
                     self.library.field_editor.as_mut()
                 {
                     *slot = rows;
@@ -1019,7 +1093,13 @@ impl AppState {
     fn preview_text(&self, field: EditField, field_preview: &FieldPreview) -> String {
         match field {
             EditField::Title => field_preview.title.clone().unwrap_or_default(),
+            EditField::SortName => field_preview.sort_name.clone().unwrap_or_default(),
             EditField::OriginalTitle => field_preview.original_title.clone().unwrap_or_default(),
+            EditField::Genres => field_preview
+                .genres
+                .as_ref()
+                .map(|genres| genres.join(", "))
+                .unwrap_or_default(),
             EditField::Overview => field_preview.overview.clone().unwrap_or_default(),
             EditField::Tags => field_preview
                 .tags
@@ -1049,11 +1129,30 @@ impl AppState {
                 .as_deref()
                 .map(|value| value.trim() == self.library.edit_source.title.trim())
                 .unwrap_or(false),
+            EditField::SortName => field_preview
+                .sort_name
+                .as_deref()
+                .map(|value| value.trim() == self.library.edit_source.sort_name.trim())
+                .unwrap_or(false),
             EditField::OriginalTitle => field_preview
                 .original_title
                 .as_deref()
                 .map(|value| value.trim() == self.library.edit_source.original_title.trim())
                 .unwrap_or(false),
+            EditField::Genres => {
+                let Some(genres) = field_preview.genres.as_ref() else {
+                    return false;
+                };
+                let source = self
+                    .library
+                    .edit_source
+                    .genres
+                    .iter()
+                    .map(|genre| genre.trim())
+                    .collect::<Vec<_>>();
+                let translated = genres.iter().map(|genre| genre.trim()).collect::<Vec<_>>();
+                !translated.is_empty() && translated == source
+            }
             EditField::Overview => field_preview
                 .overview
                 .as_deref()
@@ -1127,11 +1226,27 @@ impl AppState {
                     .edit_title
                     .update(cx, |state, cx| state.set_value(value, window, cx));
             }
+            EditField::SortName => {
+                let value = field_preview.sort_name.clone().ok_or_else(missing)?;
+                self.library
+                    .edit_sort_name
+                    .update(cx, |state, cx| state.set_value(value, window, cx));
+            }
             EditField::OriginalTitle => {
                 let value = field_preview.original_title.clone().ok_or_else(missing)?;
                 self.library
                     .edit_orig
                     .update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+            EditField::Genres => {
+                let genres = field_preview.genres.clone().ok_or_else(missing)?;
+                let source = self.library.edit_source.genres.clone();
+                let rows = build_tag_rows_from(&source, &genres, window, cx);
+                if let Some(FieldEditorState::Genres { rows: slot }) =
+                    self.library.field_editor.as_mut()
+                {
+                    *slot = rows;
+                }
             }
             EditField::Overview => {
                 let value = field_preview.overview.clone().ok_or_else(missing)?;
@@ -1177,6 +1292,7 @@ impl AppState {
             .map(FieldEditorState::field)?;
 
         let mut tags = None;
+        let mut genres = None;
         let mut people = None;
         match &self.library.field_editor {
             Some(FieldEditorState::Tags { rows }) => {
@@ -1184,6 +1300,14 @@ impl AppState {
                     rows.iter()
                         .map(|row| row.value.read(cx).value().trim().to_string())
                         .filter(|tag| !tag.is_empty())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            Some(FieldEditorState::Genres { rows }) => {
+                genres = Some(
+                    rows.iter()
+                        .map(|row| row.value.read(cx).value().trim().to_string())
+                        .filter(|genre| !genre.is_empty())
                         .collect::<Vec<_>>(),
                 );
             }
@@ -1210,6 +1334,9 @@ impl AppState {
         }
         if let Some(tags) = tags {
             self.library.edit_tags = tags;
+        }
+        if let Some(genres) = genres {
+            self.library.edit_genres = genres;
         }
         if let Some(people) = people {
             self.library.edit_people = people;
@@ -1339,8 +1466,23 @@ impl AppState {
     fn field_matches_source(&self, field: EditField, item: &ItemView) -> bool {
         match field {
             EditField::Title => item.title.trim() == item.source.title.trim(),
+            EditField::SortName => item.sort_name.trim() == item.source.sort_name.trim(),
             EditField::OriginalTitle => {
                 item.original_title.trim() == item.source.original_title.trim()
+            }
+            EditField::Genres => {
+                let source = item
+                    .source
+                    .genres
+                    .iter()
+                    .map(|genre| genre.trim())
+                    .collect::<Vec<_>>();
+                let effective = item
+                    .genres
+                    .iter()
+                    .map(|genre| genre.trim())
+                    .collect::<Vec<_>>();
+                !effective.is_empty() && effective == source
             }
             EditField::Overview => item.overview.trim() == item.source.overview.trim(),
             EditField::Tags => {

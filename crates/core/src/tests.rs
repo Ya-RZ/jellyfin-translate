@@ -118,7 +118,8 @@ fn dto_json(item: &jellyfin::ItemDto) -> Value {
             "Type": person.person_type,
         })).collect::<Vec<_>>()),
         "ProductionYear": 1994,
-        "Genres": ["Drama"],
+        "Genres": item.genres,
+        "SortName": item.sort_name,
         "LockedFields": ["Runtime"],
         "Type": item.item_type,
     })
@@ -237,8 +238,9 @@ impl JellyfinApi for FakeApi {
                     .map(|values| values.iter().any(|value| value.as_str() == Some(rejected)))
                     .unwrap_or(false);
                 if contains {
-                    return Err(anyhow!(
-                        "HTTP 400: LockedFields value {rejected:?} is not a valid MetadataField"
+                    return Err(fake_api_error(
+                        400,
+                        &format!("POST /Items/{item_id} (LockedFields {rejected})"),
                     ));
                 }
             }
@@ -335,6 +337,8 @@ fn movie(id: &str, name: &str) -> jellyfin::ItemDto {
         id: id.to_string(),
         name: Some(name.to_string()),
         original_title: Some(name.to_string()),
+        sort_name: Some(name.to_string()),
+        genres: Some(vec!["Drama".into()]),
         overview: Some(format!("Overview of {name}")),
         tags: Some(vec!["Sci-Fi".into(), "Heist".into()]),
         people: Some(vec![
@@ -510,6 +514,11 @@ async fn sync_pages_through_libraries_and_reports_progress() {
     assert_eq!(first.source.overview, first.overview);
     assert_eq!(first.source.tags, first.tags);
     assert_eq!(first.source.people[0].id.as_deref(), Some("p1"));
+    // Genres/SortName are synced from Jellyfin's Genres/SortName fields.
+    assert_eq!(first.sort_name, "Movie 000");
+    assert_eq!(first.genres, vec!["Drama".to_string()]);
+    assert_eq!(first.source.sort_name, "Movie 000");
+    assert_eq!(first.source.genres, vec!["Drama".to_string()]);
 }
 
 #[tokio::test]
@@ -623,6 +632,8 @@ async fn save_draft_downgrades_written_to_draft_and_rejects_locked() {
         .save_draft(
             "m1",
             ItemEdit {
+                sort_name: "盗梦空间 排序".into(),
+                genres: vec!["剧情".into()],
                 title: "盗梦空间".into(),
                 original_title: "Inception".into(),
                 overview: "简介".into(),
@@ -639,6 +650,8 @@ async fn save_draft_downgrades_written_to_draft_and_rejects_locked() {
     let item = service.items("movies").unwrap().remove(0);
     assert_eq!(item.status, TranslationStatus::Draft);
     assert_eq!(item.title, "盗梦空间");
+    assert_eq!(item.sort_name, "盗梦空间 排序");
+    assert_eq!(item.genres, vec!["剧情".to_string()]);
     assert_eq!(item.tags, vec!["科幻".to_string()]);
 
     service.set_locked(&["m1".into()], true).unwrap();
@@ -646,6 +659,8 @@ async fn save_draft_downgrades_written_to_draft_and_rejects_locked() {
         .save_draft(
             "m1",
             ItemEdit {
+                sort_name: String::new(),
+                genres: Vec::new(),
                 title: "x".into(),
                 original_title: String::new(),
                 overview: String::new(),
@@ -670,6 +685,8 @@ async fn write_back_updates_metadata_only_and_locks_fields() {
         .save_draft(
             "m1",
             ItemEdit {
+                sort_name: "Inception".into(),
+                genres: vec!["Drama".into()],
                 title: "盗梦空间".into(),
                 original_title: "Inception".into(),
                 overview: "简介".into(),
@@ -732,6 +749,8 @@ async fn write_back_detects_a_server_that_ignored_a_field() {
         .save_draft(
             "m1",
             ItemEdit {
+                sort_name: "盗梦空间 排序".into(),
+                genres: vec!["剧情".into()],
                 title: "盗梦空间".into(),
                 original_title: "Inception".into(),
                 overview: "简介".into(),
@@ -1138,6 +1157,8 @@ async fn write_back_fields_only_writes_selected_field_and_keeps_draft() {
         .save_draft(
             "m1",
             ItemEdit {
+                sort_name: "盗梦空间 排序".into(),
+                genres: vec!["剧情".into()],
                 title: "盗梦空间".into(),
                 original_title: "Inception".into(),
                 overview: "简介".into(),
@@ -1434,6 +1455,8 @@ async fn connected_service(label: &str, fake: &Arc<FakeApi>) -> (AppService, std
 
 fn title_edit(title: &str) -> ItemEdit {
     ItemEdit {
+        sort_name: String::new(),
+        genres: Vec::new(),
         title: title.to_string(),
         original_title: "Inception".into(),
         overview: "简介".into(),
@@ -1555,4 +1578,303 @@ async fn item_errors_keep_the_http_status_when_both_routes_fail() {
 
     drop(service);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn translate_fields_supports_genres_and_sort_name() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    let service = synced_service(&fake).await;
+    service.install_translator(EchoTranslator::new()).unwrap();
+
+    let report = service
+        .translate_fields(
+            "m1",
+            vec![FieldKind::SortName, FieldKind::Genres],
+            templates(),
+            settings(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.translated, 1);
+
+    let item = service.items("movies").unwrap().remove(0);
+    assert_eq!(item.sort_name, "[zh-CN] Inception");
+    assert_eq!(item.genres, vec!["[zh-CN] Drama".to_string()]);
+    // Other fields are untouched; source keeps the server originals.
+    assert_eq!(item.title, "Inception");
+    assert_eq!(item.tags, vec!["Sci-Fi", "Heist"]);
+    assert_eq!(item.source.sort_name, "Inception");
+    assert_eq!(item.source.genres, vec!["Drama".to_string()]);
+
+    let rows = {
+        let inner = service.inner().unwrap();
+        inner.store.list_translations("m1").unwrap()
+    };
+    assert!(rows.iter().any(|row| row.field == "sort_name"));
+    assert!(rows.iter().any(|row| row.field == "genres"));
+}
+
+#[tokio::test]
+async fn translate_preview_supports_genres_and_sort_name_without_saving() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    let service = synced_service(&fake).await;
+    service.install_translator(EchoTranslator::new()).unwrap();
+
+    let preview = service
+        .translate_fields_preview(
+            "m1",
+            vec![FieldKind::SortName, FieldKind::Genres],
+            templates(),
+            settings(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.sort_name.as_deref(), Some("[zh-CN] Inception"));
+    assert_eq!(preview.genres.unwrap(), vec!["[zh-CN] Drama".to_string()]);
+    assert!(preview.title.is_none());
+    assert!(preview.overview.is_none());
+
+    let record = {
+        let inner = service.inner().unwrap();
+        inner.store.get_item("m1").unwrap().unwrap()
+    };
+    assert_eq!(record.status, store::STATUS_UNTRANSLATED);
+    assert!(record.draft_sort_name.is_none());
+    assert!(record.draft_genres.is_none());
+}
+
+#[tokio::test]
+async fn write_back_fields_only_writes_genres() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    let service = synced_service(&fake).await;
+
+    service
+        .save_draft(
+            "m1",
+            ItemEdit {
+                sort_name: "盗梦空间".into(),
+                genres: vec!["剧情".into(), "科幻".into()],
+                title: "盗梦空间".into(),
+                original_title: "Inception".into(),
+                overview: "简介".into(),
+                tags: vec!["科幻".into()],
+                people: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let report = service
+        .write_back_fields("m1", vec![FieldKind::Genres])
+        .await
+        .unwrap();
+    assert_eq!(report.written, 1);
+
+    let updates = fake.updates();
+    assert_eq!(updates.len(), 1);
+    let sent = &updates[0].1;
+    assert_eq!(sent["Genres"], json!(["剧情", "科幻"]));
+    // SortName/Name were not selected: server values are kept.
+    assert_eq!(sent["SortName"], "Inception");
+    assert_eq!(sent["Name"], "Inception");
+    let locked = sent["LockedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(locked.contains(&"Genres"));
+    assert!(!locked.contains(&"SortName"));
+    assert!(!locked.contains(&"Name"));
+
+    let item = service.items("movies").unwrap().remove(0);
+    assert_eq!(item.status, TranslationStatus::Written);
+    assert_eq!(item.genres, vec!["剧情".to_string(), "科幻".to_string()]);
+    assert_eq!(item.sort_name, "盗梦空间");
+}
+
+#[tokio::test]
+async fn sort_name_lock_falls_back_when_the_server_rejects_it() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    fake.reject_locked_field("SortName");
+    let service = synced_service(&fake).await;
+
+    service
+        .save_draft(
+            "m1",
+            ItemEdit {
+                sort_name: "盗梦空间".into(),
+                genres: Vec::new(),
+                title: "Inception".into(),
+                original_title: "Inception".into(),
+                overview: "Overview of Inception".into(),
+                tags: vec!["Sci-Fi".into(), "Heist".into()],
+                people: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let report = service
+        .write_back_fields("m1", vec![FieldKind::SortName])
+        .await
+        .unwrap();
+    assert_eq!(report.written, 1);
+    assert!(report.failed.is_empty());
+
+    let updates = fake.updates();
+    assert_eq!(updates.len(), 2, "one rejected attempt + one retry");
+    let first = updates[0].1["LockedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(first.contains(&"SortName"));
+    let retry = updates[1].1["LockedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(!retry.contains(&"SortName"));
+
+    // The session remembers it: the next write does not include/retry it.
+    service
+        .write_back_fields("m1", vec![FieldKind::Genres])
+        .await
+        .unwrap();
+    let updates = fake.updates();
+    assert_eq!(updates.len(), 3);
+    let last = updates[2].1["LockedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(!last.contains(&"SortName"));
+    assert!(last.contains(&"Genres"));
+}
+
+#[tokio::test]
+async fn write_back_skips_empty_unknown_source_fields() {
+    // Simulate a row synced before Genres/SortName existed: the server has no
+    // value and the local mirror is empty.
+    let mut legacy = movie("m1", "Inception");
+    legacy.genres = None;
+    legacy.sort_name = None;
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), legacy)],
+    );
+    let service = synced_service(&fake).await;
+
+    let item = service.items("movies").unwrap().remove(0);
+    assert!(item.genres.is_empty());
+    assert!(item.sort_name.is_empty());
+
+    // Full write-back must not send empty Genres/SortName (which would wipe the
+    // server) and must not lock those fields.
+    let report = service.write_back(vec!["m1".into()]).await.unwrap();
+    assert_eq!(report.written, 1);
+    assert!(report.failed.is_empty());
+
+    let sent = &fake.updates()[0].1;
+    assert_eq!(sent["Genres"], Value::Null);
+    assert_eq!(sent["SortName"], Value::Null);
+    // Fields that do have source data are written as before.
+    assert_eq!(sent["Name"], "Inception");
+    assert_eq!(sent["Overview"], "Overview of Inception");
+    assert_eq!(sent["Tags"], json!(["Sci-Fi", "Heist"]));
+
+    let locked = sent["LockedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(locked.contains(&"Name"));
+    assert!(!locked.contains(&"Genres"));
+    assert!(!locked.contains(&"SortName"));
+}
+
+#[tokio::test]
+async fn write_back_with_only_empty_source_fields_is_a_noop() {
+    let mut legacy = movie("m1", "Inception");
+    legacy.genres = None;
+    legacy.sort_name = None;
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), legacy)],
+    );
+    let service = synced_service(&fake).await;
+
+    let report = service
+        .write_back_fields("m1", vec![FieldKind::Genres, FieldKind::SortName])
+        .await
+        .unwrap();
+    assert_eq!(report.written, 0);
+    assert!(report.failed.is_empty());
+    assert!(fake.updates().is_empty(), "no request should be sent");
+    assert_eq!(
+        service.items("movies").unwrap()[0].status,
+        TranslationStatus::Untranslated
+    );
+}
+
+#[tokio::test]
+async fn empty_drafts_are_written_and_locked() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    let service = synced_service(&fake).await;
+
+    service
+        .save_draft(
+            "m1",
+            ItemEdit {
+                sort_name: String::new(),
+                genres: Vec::new(),
+                title: "Inception".into(),
+                original_title: "Inception".into(),
+                overview: "Overview of Inception".into(),
+                tags: vec!["Sci-Fi".into(), "Heist".into()],
+                people: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let report = service
+        .write_back_fields("m1", vec![FieldKind::Genres, FieldKind::SortName])
+        .await
+        .unwrap();
+    assert_eq!(report.written, 1);
+
+    let sent = &fake.updates()[0].1;
+    assert_eq!(sent["Genres"], json!([]));
+    assert_eq!(sent["SortName"], "");
+    let locked = sent["LockedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(locked.contains(&"Genres"));
+    assert!(locked.contains(&"SortName"));
+
+    assert_eq!(
+        service.items("movies").unwrap()[0].status,
+        TranslationStatus::Written
+    );
 }

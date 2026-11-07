@@ -49,6 +49,8 @@ pub struct ItemRecord {
     /// Original `Name` from Jellyfin (and the pre-write-back source snapshot).
     pub name: Option<String>,
     pub original_title: Option<String>,
+    pub sort_name: Option<String>,
+    pub genres: Vec<String>,
     pub overview: Option<String>,
     pub tags: Vec<String>,
     pub people: Vec<PersonRecord>,
@@ -63,6 +65,8 @@ pub struct ItemRecord {
     pub locked: bool,
     pub draft_name: Option<String>,
     pub draft_original_title: Option<String>,
+    pub draft_sort_name: Option<String>,
+    pub draft_genres: Option<Vec<String>>,
     pub draft_overview: Option<String>,
     pub draft_tags: Option<Vec<String>>,
     pub draft_people: Option<Vec<PersonRecord>>,
@@ -76,6 +80,8 @@ impl Default for ItemRecord {
             item_type: String::new(),
             name: None,
             original_title: None,
+            sort_name: None,
+            genres: Vec::new(),
             overview: None,
             tags: Vec::new(),
             people: Vec::new(),
@@ -87,6 +93,8 @@ impl Default for ItemRecord {
             locked: false,
             draft_name: None,
             draft_original_title: None,
+            draft_sort_name: None,
+            draft_genres: None,
             draft_overview: None,
             draft_tags: None,
             draft_people: None,
@@ -102,6 +110,17 @@ impl ItemRecord {
 
     pub fn effective_original_title(&self) -> &str {
         draft_or(&self.draft_original_title, &self.original_title)
+    }
+
+    pub fn effective_sort_name(&self) -> &str {
+        draft_or(&self.draft_sort_name, &self.sort_name)
+    }
+
+    pub fn effective_genres(&self) -> &[String] {
+        match &self.draft_genres {
+            Some(genres) => genres,
+            None => &self.genres,
+        }
     }
 
     pub fn effective_overview(&self) -> &str {
@@ -132,6 +151,8 @@ fn draft_or<'a>(draft: &'a Option<String>, source: &'a Option<String>) -> &'a st
 pub struct ItemDraft {
     pub name: String,
     pub original_title: String,
+    pub sort_name: String,
+    pub genres: Vec<String>,
     pub overview: String,
     pub tags: Vec<String>,
     pub people: Vec<PersonRecord>,
@@ -159,7 +180,8 @@ pub struct TranslationRecord {
 
 const SELECT_ITEMS: &str = "SELECT id, library_id, item_type, name, original_title, overview, \
      tags_json, people_json, image_tag, locked_fields_json, source_hash, synced_at, status, locked, \
-     draft_name, draft_original_title, draft_overview, draft_tags_json, draft_people_json FROM items";
+     draft_name, draft_original_title, draft_overview, draft_tags_json, draft_people_json, \
+     genres_json, sort_name, draft_sort_name, draft_genres_json FROM items";
 
 pub struct Store {
     conn: Connection,
@@ -207,6 +229,8 @@ impl Store {
                 item_type          TEXT NOT NULL,
                 name               TEXT,
                 original_title     TEXT,
+                sort_name          TEXT,
+                genres_json        TEXT NOT NULL DEFAULT '[]',
                 overview           TEXT,
                 tags_json          TEXT NOT NULL DEFAULT '[]',
                 people_json        TEXT NOT NULL DEFAULT '[]',
@@ -218,6 +242,8 @@ impl Store {
                 locked             INTEGER NOT NULL DEFAULT 0,
                 draft_name         TEXT,
                 draft_original_title TEXT,
+                draft_sort_name    TEXT,
+                draft_genres_json  TEXT,
                 draft_overview     TEXT,
                 draft_tags_json    TEXT,
                 draft_people_json  TEXT
@@ -260,8 +286,12 @@ impl Store {
         for (column, decl) in [
             ("status", "TEXT NOT NULL DEFAULT 'untranslated'"),
             ("locked", "INTEGER NOT NULL DEFAULT 0"),
+            ("sort_name", "TEXT"),
+            ("genres_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("draft_name", "TEXT"),
             ("draft_original_title", "TEXT"),
+            ("draft_sort_name", "TEXT"),
+            ("draft_genres_json", "TEXT"),
             ("draft_overview", "TEXT"),
             ("draft_tags_json", "TEXT"),
             ("draft_people_json", "TEXT"),
@@ -401,9 +431,9 @@ impl Store {
                                    tags_json, people_json, image_tag, locked_fields_json,
                                    source_hash, synced_at, status, locked,
                                    draft_name, draft_original_title, draft_overview,
-                                   draft_tags_json, draft_people_json)
+                                   draft_tags_json, draft_people_json, genres_json, sort_name)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        'untranslated', 0, NULL, NULL, NULL, NULL, NULL)
+                        'untranslated', 0, NULL, NULL, NULL, NULL, NULL, ?13, ?14)
                 ON CONFLICT(id) DO UPDATE SET
                     library_id = excluded.library_id,
                     item_type = excluded.item_type,
@@ -413,6 +443,10 @@ impl Store {
                                           ELSE excluded.original_title END,
                     overview = CASE WHEN items.status = 'written' THEN items.overview
                                     ELSE excluded.overview END,
+                    sort_name = CASE WHEN items.status = 'written' THEN items.sort_name
+                                     ELSE excluded.sort_name END,
+                    genres_json = CASE WHEN items.status = 'written' THEN items.genres_json
+                                       ELSE excluded.genres_json END,
                     tags_json = CASE WHEN items.status = 'written' THEN items.tags_json
                                      ELSE excluded.tags_json END,
                     people_json = CASE WHEN items.status = 'written' THEN items.people_json
@@ -439,6 +473,8 @@ impl Store {
                     serde_json::to_string(&item.locked_fields)?,
                     item.source_hash,
                     item.synced_at,
+                    serde_json::to_string(&item.genres)?,
+                    item.sort_name,
                 ])?;
             }
         }
@@ -486,12 +522,18 @@ impl Store {
         let locked_json: String = row.get(9)?;
         let draft_tags_json: Option<String> = row.get(17)?;
         let draft_people_json: Option<String> = row.get(18)?;
+        let genres_json: String = row.get(19)?;
+        let sort_name: Option<String> = row.get(20)?;
+        let draft_sort_name: Option<String> = row.get(21)?;
+        let draft_genres_json: Option<String> = row.get(22)?;
         Ok(ItemRecord {
             id: row.get(0)?,
             library_id: row.get(1)?,
             item_type: row.get(2)?,
             name: row.get(3)?,
             original_title: row.get(4)?,
+            sort_name,
+            genres: serde_json::from_str(&genres_json).unwrap_or_default(),
             overview: row.get(5)?,
             tags: serde_json::from_str(&tags_json).unwrap_or_default(),
             people: serde_json::from_str(&people_json).unwrap_or_default(),
@@ -503,6 +545,10 @@ impl Store {
             locked: row.get::<_, i64>(13)? != 0,
             draft_name: row.get(14)?,
             draft_original_title: row.get(15)?,
+            draft_sort_name,
+            draft_genres: draft_genres_json
+                .as_deref()
+                .map(|raw| serde_json::from_str(raw).unwrap_or_default()),
             draft_overview: row.get(16)?,
             draft_tags: draft_tags_json
                 .as_deref()
@@ -518,7 +564,8 @@ impl Store {
     pub fn save_draft(&mut self, item_id: &str, draft: &ItemDraft) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE items SET draft_name = ?2, draft_original_title = ?3, draft_overview = ?4,
-                              draft_tags_json = ?5, draft_people_json = ?6, status = ?7
+                              draft_tags_json = ?5, draft_people_json = ?6, status = ?7,
+                              draft_sort_name = ?8, draft_genres_json = ?9
              WHERE id = ?1",
             params![
                 item_id,
@@ -528,6 +575,8 @@ impl Store {
                 serde_json::to_string(&draft.tags)?,
                 serde_json::to_string(&draft.people)?,
                 STATUS_DRAFT,
+                draft.sort_name,
+                serde_json::to_string(&draft.genres)?,
             ],
         )?;
         anyhow::ensure!(changed > 0, "item {item_id} not found");
@@ -785,6 +834,8 @@ mod tests {
         let draft = ItemDraft {
             name: "测试".into(),
             original_title: "测试原名".into(),
+            sort_name: "测试排序".into(),
+            genres: vec!["剧情".into()],
             overview: "简介".into(),
             tags: vec!["标签".into()],
             people: vec![PersonRecord {
@@ -802,6 +853,8 @@ mod tests {
         assert!(item.locked);
         assert_eq!(item.effective_name(), "测试");
         assert_eq!(item.effective_tags(), ["标签"]);
+        assert_eq!(item.effective_sort_name(), "测试排序");
+        assert_eq!(item.effective_genres(), ["剧情"]);
         assert_eq!(item.draft_original_title.as_deref(), Some("测试原名"));
 
         // A re-sync keeps draft/status/lock.
@@ -1008,6 +1061,10 @@ mod tests {
         let item = store.get_item("old").unwrap().unwrap();
         assert_eq!(item.status, STATUS_UNTRANSLATED);
         assert!(!item.locked);
+        assert!(item.genres.is_empty());
+        assert!(item.sort_name.is_none());
+        assert!(item.draft_genres.is_none());
+        assert!(item.draft_sort_name.is_none());
 
         // The migrated store keeps working after another (idempotent) migrate.
         store.migrate().unwrap();

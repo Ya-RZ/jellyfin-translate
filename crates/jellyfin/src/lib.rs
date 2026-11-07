@@ -15,7 +15,7 @@ pub const CLIENT_NAME: &str = "jellyfin-translate";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Fields requested from `/Items` so the caller gets everything the UI needs.
-pub const ITEM_FIELDS: &str = "Overview,OriginalTitle,Tags,Genres,People,ImageTags,ProductionYear,PremiereDate,LockedFields,ProviderIds,SeriesId,ParentIndexNumber,IndexNumber";
+pub const ITEM_FIELDS: &str = "Overview,OriginalTitle,SortName,Tags,Genres,People,ImageTags,ProductionYear,PremiereDate,LockedFields,ProviderIds,SeriesId,ParentIndexNumber,IndexNumber";
 
 /// Maximum number of response-body characters quoted in error messages.
 const ERROR_SNIPPET_CHARS: usize = 400;
@@ -100,6 +100,8 @@ pub struct ItemDto {
     pub name: Option<String>,
     #[serde(default)]
     pub original_title: Option<String>,
+    #[serde(default)]
+    pub sort_name: Option<String>,
     #[serde(default)]
     pub overview: Option<String>,
     #[serde(default)]

@@ -51,8 +51,9 @@ pub(crate) struct LibraryState {
     pub(crate) edit_busy: bool,
     pub(crate) edit_error: Option<SharedString>,
     pub(crate) edit_source: EditSource,
-    /// Current draft values for the two multi-row fields.
+    /// Current draft values for the multi-row fields.
     pub(crate) edit_tags: Vec<String>,
+    pub(crate) edit_genres: Vec<String>,
     pub(crate) edit_people: Vec<PersonView>,
     pub(crate) field_editor: Option<FieldEditorState>,
     pub(crate) field_busy: bool,
@@ -64,6 +65,7 @@ pub(crate) struct LibraryState {
     pub(crate) edit_title: Entity<TextareaState>,
     pub(crate) edit_orig: Entity<TextareaState>,
     pub(crate) edit_overview: Entity<TextareaState>,
+    pub(crate) edit_sort_name: Entity<TextareaState>,
 }
 
 impl LibraryState {
@@ -81,6 +83,7 @@ impl LibraryState {
             edit_error: None,
             edit_source: EditSource::default(),
             edit_tags: Vec::new(),
+            edit_genres: Vec::new(),
             edit_people: Vec::new(),
             field_editor: None,
             field_busy: false,
@@ -92,6 +95,7 @@ impl LibraryState {
             edit_title: cx.new(|cx| TextareaState::new(window, cx)),
             edit_orig: cx.new(|cx| TextareaState::new(window, cx)),
             edit_overview: cx.new(|cx| TextareaState::new(window, cx)),
+            edit_sort_name: cx.new(|cx| TextareaState::new(window, cx)),
         }
     }
 
@@ -323,6 +327,7 @@ impl AppState {
         self.library.editing = Some(item_id);
         self.library.edit_source = EditSource::from_item(&item);
         self.library.edit_tags = item.tags.clone();
+        self.library.edit_genres = item.genres.clone();
         self.library.edit_people = item.people.clone();
         self.library.edit_busy = false;
         self.library.edit_error = None;
@@ -337,6 +342,9 @@ impl AppState {
         });
         self.library.edit_overview.update(cx, |state, cx| {
             state.set_value(item.overview.clone(), window, cx)
+        });
+        self.library.edit_sort_name.update(cx, |state, cx| {
+            state.set_value(item.sort_name.clone(), window, cx)
         });
         cx.notify();
     }

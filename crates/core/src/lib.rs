@@ -46,25 +46,36 @@ pub enum TranslationStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FieldKind {
     Title,
+    SortName,
     OriginalTitle,
+    Genres,
     Overview,
     Tags,
     People,
 }
 
-const ALL_FIELDS: [FieldKind; 5] = [
+const ALL_FIELDS: [FieldKind; 7] = [
     FieldKind::Title,
+    FieldKind::SortName,
     FieldKind::OriginalTitle,
+    FieldKind::Genres,
     FieldKind::Overview,
     FieldKind::Tags,
     FieldKind::People,
 ];
 
+/// `MetadataField` values the official Jellyfin enum does not define (they are
+/// not lockable there). If a server rejects them with 400, we retry without
+/// these locks and remember it for the session.
+const OPTIONAL_LOCK_FIELDS: &[&str] = &["OriginalTitle", "SortName"];
+
 /// The server's original metadata snapshot, unaffected by local drafts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ItemSource {
     pub title: String,
+    pub sort_name: String,
     pub original_title: String,
+    pub genres: Vec<String>,
     pub overview: String,
     pub tags: Vec<String>,
     pub people: Vec<PersonView>,
@@ -76,7 +87,9 @@ pub struct ItemSource {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FieldPreview {
     pub title: Option<String>,
+    pub sort_name: Option<String>,
     pub original_title: Option<String>,
+    pub genres: Option<Vec<String>>,
     pub overview: Option<String>,
     pub tags: Option<Vec<String>>,
     pub people: Option<Vec<PersonView>>,
@@ -99,7 +112,9 @@ pub struct ItemView {
     pub item_type: String,
     /// Effective title: the draft when one exists, otherwise the server source.
     pub title: String,
+    pub sort_name: String,
     pub original_title: String,
+    pub genres: Vec<String>,
     pub overview: String,
     pub tags: Vec<String>,
     pub people: Vec<PersonView>,
@@ -113,7 +128,9 @@ pub struct ItemView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ItemEdit {
     pub title: String,
+    pub sort_name: String,
     pub original_title: String,
+    pub genres: Vec<String>,
     pub overview: String,
     pub tags: Vec<String>,
     pub people: Vec<PersonView>,
@@ -219,9 +236,9 @@ struct Inner {
     /// `/Users/{id}/Items/{item}` since Jellyfin 12.x rejects the user-less
     /// route for API keys without a user context.
     user_id: Option<String>,
-    /// Some Jellyfin builds reject `OriginalTitle` in `LockedFields`; after the
-    /// first rejection we stop sending it for the rest of the session.
-    original_title_lock_supported: bool,
+    /// `LockedFields` values rejected by this server (400); skipped for the
+    /// rest of the session.
+    unsupported_locks: HashSet<String>,
     #[cfg(test)]
     translator: Option<Arc<dyn PromptTranslator>>,
     /// Lets tests exercise `connect` without a real server.
@@ -273,7 +290,7 @@ impl AppService {
                 store,
                 api: None,
                 user_id: None,
-                original_title_lock_supported: true,
+                unsupported_locks: HashSet::new(),
                 #[cfg(test)]
                 translator: None,
                 #[cfg(test)]
@@ -292,7 +309,7 @@ impl AppService {
                 store: Store::open_in_memory()?,
                 api: None,
                 user_id: None,
-                original_title_lock_supported: true,
+                unsupported_locks: HashSet::new(),
                 #[cfg(test)]
                 translator: None,
                 #[cfg(test)]
@@ -693,7 +710,9 @@ impl AppService {
         let draft = ItemDraft {
             people: merge_people(&existing.people, edit.people),
             name: edit.title,
+            sort_name: edit.sort_name,
             original_title: edit.original_title,
+            genres: edit.genres,
             overview: edit.overview,
             tags: edit.tags,
         };
@@ -787,8 +806,10 @@ impl AppService {
         let has = |field: FieldKind| fields.contains(&field);
         Ok(FieldPreview {
             title: has(FieldKind::Title).then(|| outcome.draft.name.clone()),
+            sort_name: has(FieldKind::SortName).then(|| outcome.draft.sort_name.clone()),
             original_title: has(FieldKind::OriginalTitle)
                 .then(|| outcome.draft.original_title.clone()),
+            genres: has(FieldKind::Genres).then(|| outcome.draft.genres.clone()),
             overview: has(FieldKind::Overview).then(|| outcome.draft.overview.clone()),
             tags: has(FieldKind::Tags).then(|| outcome.draft.tags.clone()),
             people: has(FieldKind::People).then(|| {
@@ -904,6 +925,18 @@ impl AppService {
         };
         if item.locked {
             tracing::debug!(item = %item.id, "skip locked item");
+            return Ok(WriteReport::default());
+        }
+
+        let fields = fields
+            .into_iter()
+            .filter(|field| field_has_content(&item, *field))
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            tracing::debug!(
+                item = %item.id,
+                "no selected field has content; skipping write-back"
+            );
             return Ok(WriteReport::default());
         }
 
@@ -1069,10 +1102,13 @@ fn item_record_from_dto(library_id: &str, dto: &jellyfin::ItemDto) -> ItemRecord
         .image_tags
         .as_ref()
         .and_then(|tags| tags.get("Primary").cloned());
+    let genres = dto.genres.clone().unwrap_or_default();
     let source_hash = source_hash(
         dto.name.as_deref(),
+        dto.sort_name.as_deref(),
         dto.original_title.as_deref(),
         dto.overview.as_deref(),
+        &genres,
         &tags,
         &people,
     );
@@ -1085,6 +1121,8 @@ fn item_record_from_dto(library_id: &str, dto: &jellyfin::ItemDto) -> ItemRecord
             .clone()
             .unwrap_or_else(|| "Unknown".to_string()),
         name: dto.name.clone(),
+        sort_name: dto.sort_name.clone(),
+        genres,
         original_title: dto.original_title.clone(),
         overview: dto.overview.clone(),
         tags,
@@ -1097,6 +1135,8 @@ fn item_record_from_dto(library_id: &str, dto: &jellyfin::ItemDto) -> ItemRecord
         locked: false,
         draft_name: None,
         draft_original_title: None,
+        draft_sort_name: None,
+        draft_genres: None,
         draft_overview: None,
         draft_tags: None,
         draft_people: None,
@@ -1105,13 +1145,15 @@ fn item_record_from_dto(library_id: &str, dto: &jellyfin::ItemDto) -> ItemRecord
 
 fn source_hash(
     name: Option<&str>,
+    sort_name: Option<&str>,
     original_title: Option<&str>,
     overview: Option<&str>,
+    genres: &[String],
     tags: &[String],
     people: &[PersonRecord],
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    for value in [name, original_title, overview] {
+    for value in [name, sort_name, original_title, overview] {
         match value {
             Some(text) => {
                 hasher.update(text.as_bytes());
@@ -1120,6 +1162,10 @@ fn source_hash(
                 hasher.update(b"\0");
             }
         }
+        hasher.update(b"\x1e");
+    }
+    for genre in genres {
+        hasher.update(genre.as_bytes());
         hasher.update(b"\x1e");
     }
     for tag in tags {
@@ -1137,13 +1183,17 @@ fn source_hash(
 
 fn item_view(record: ItemRecord) -> ItemView {
     let title = record.effective_name().to_string();
+    let sort_name = record.effective_sort_name().to_string();
     let original_title = record.effective_original_title().to_string();
+    let genres = record.effective_genres().to_vec();
     let overview = record.effective_overview().to_string();
     let tags = record.effective_tags().to_vec();
     let people = record.effective_people().iter().map(person_view).collect();
     let source = ItemSource {
         title: record.name.clone().unwrap_or_default(),
+        sort_name: record.sort_name.clone().unwrap_or_default(),
         original_title: record.original_title.clone().unwrap_or_default(),
+        genres: record.genres.clone(),
         overview: record.overview.clone().unwrap_or_default(),
         tags: record.tags.clone(),
         people: record.people.iter().map(person_view).collect(),
@@ -1153,7 +1203,9 @@ fn item_view(record: ItemRecord) -> ItemView {
         library_id: record.library_id,
         item_type: record.item_type,
         title,
+        sort_name,
         original_title,
+        genres,
         overview,
         tags,
         people,
@@ -1240,7 +1292,9 @@ async fn translate_item(
     // keep whatever draft (or source text) they already had.
     let mut draft = ItemDraft {
         name: item.effective_name().to_string(),
+        sort_name: item.effective_sort_name().to_string(),
         original_title: item.effective_original_title().to_string(),
+        genres: item.effective_genres().to_vec(),
         overview: item.effective_overview().to_string(),
         tags: item.effective_tags().to_vec(),
         people: item.effective_people().to_vec(),
@@ -1254,6 +1308,14 @@ async fn translate_item(
             .context("翻译标题失败")?;
     }
 
+    if fields.contains(&FieldKind::SortName) {
+        let source = source_text(&item.sort_name, &item.draft_sort_name);
+        draft.sort_name =
+            translate_single(translator, &source, &templates.title, settings, "sort_name")
+                .await
+                .context("翻译排序标题失败")?;
+    }
+
     if fields.contains(&FieldKind::OriginalTitle) {
         let source = source_text(&item.original_title, &item.draft_original_title);
         draft.original_title = translate_single(
@@ -1265,6 +1327,17 @@ async fn translate_item(
         )
         .await
         .context("翻译原名失败")?;
+    }
+
+    if fields.contains(&FieldKind::Genres) {
+        let source_genres = if item.genres.is_empty() {
+            item.effective_genres().to_vec()
+        } else {
+            item.genres.clone()
+        };
+        draft.genres = translate_tags(translator, &source_genres, templates, settings)
+            .await
+            .context("翻译类型失败")?;
     }
 
     if fields.contains(&FieldKind::Overview) {
@@ -1561,7 +1634,9 @@ fn record_translations(
     for field in fields {
         let (name, text) = match field {
             FieldKind::Title => ("name", draft.name.clone()),
+            FieldKind::SortName => ("sort_name", draft.sort_name.clone()),
             FieldKind::OriginalTitle => ("original_title", draft.original_title.clone()),
+            FieldKind::Genres => ("genres", serde_json::to_string(&draft.genres)?),
             FieldKind::Overview => ("overview", draft.overview.clone()),
             FieldKind::Tags => ("tags", serde_json::to_string(&draft.tags)?),
             FieldKind::People => ("people", serde_json::to_string(&draft.people)?),
@@ -1585,6 +1660,13 @@ fn record_translations(
 // Write-back
 // ---------------------------------------------------------------------------
 
+fn is_bad_request(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<jellyfin::ApiError>()
+        .and_then(|error| error.status)
+        == Some(400)
+}
+
 fn is_fallback_status(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<jellyfin::ApiError>()
@@ -1596,7 +1678,9 @@ fn is_fallback_status(error: &anyhow::Error) -> bool {
 #[derive(Debug, Default)]
 struct ExpectedWrite {
     name: Option<String>,
+    sort_name: Option<String>,
     original_title: Option<String>,
+    genres: Option<Vec<String>>,
     overview: Option<String>,
     tags: Option<Vec<String>>,
     people: Option<Vec<PersonRecord>>,
@@ -1605,10 +1689,56 @@ struct ExpectedWrite {
 fn locked_field_name(field: FieldKind) -> &'static str {
     match field {
         FieldKind::Title => "Name",
+        FieldKind::SortName => "SortName",
         FieldKind::OriginalTitle => "OriginalTitle",
+        FieldKind::Genres => "Genres",
         FieldKind::Overview => "Overview",
         FieldKind::Tags => "Tags",
         FieldKind::People => "Cast",
+    }
+}
+
+/// A selected field is only written when it has content to write: an explicit
+/// draft (even an empty one) or a non-empty source value. Empty *unknown*
+/// source fields (e.g. Genres/SortName on rows synced before those columns
+/// existed) are skipped so an all-field write-back cannot wipe server data.
+fn field_has_content(item: &ItemRecord, field: FieldKind) -> bool {
+    match field {
+        FieldKind::Title => {
+            item.draft_name.is_some()
+                || item
+                    .name
+                    .as_deref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+        }
+        FieldKind::SortName => {
+            item.draft_sort_name.is_some()
+                || item
+                    .sort_name
+                    .as_deref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+        }
+        FieldKind::OriginalTitle => {
+            item.draft_original_title.is_some()
+                || item
+                    .original_title
+                    .as_deref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+        }
+        FieldKind::Genres => item.draft_genres.is_some() || !item.genres.is_empty(),
+        FieldKind::Overview => {
+            item.draft_overview.is_some()
+                || item
+                    .overview
+                    .as_deref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+        }
+        FieldKind::Tags => item.draft_tags.is_some() || !item.tags.is_empty(),
+        FieldKind::People => item.draft_people.is_some() || !item.people.is_empty(),
     }
 }
 
@@ -1649,6 +1779,12 @@ impl AppService {
                 object.insert("Name".to_string(), json!(name));
                 expected.name = Some(name);
             }
+            if fields.contains(&FieldKind::SortName) {
+                if let Some(value) = effective_option(&item.draft_sort_name, &item.sort_name) {
+                    object.insert("SortName".to_string(), json!(value));
+                    expected.sort_name = Some(value.to_string());
+                }
+            }
             if fields.contains(&FieldKind::OriginalTitle) {
                 if let Some(value) =
                     effective_option(&item.draft_original_title, &item.original_title)
@@ -1656,6 +1792,11 @@ impl AppService {
                     object.insert("OriginalTitle".to_string(), json!(value));
                     expected.original_title = Some(value.to_string());
                 }
+            }
+            if fields.contains(&FieldKind::Genres) {
+                let genres = item.effective_genres().to_vec();
+                object.insert("Genres".to_string(), json!(genres));
+                expected.genres = Some(genres);
             }
             if fields.contains(&FieldKind::Overview) {
                 if let Some(value) = effective_option(&item.draft_overview, &item.overview) {
@@ -1677,45 +1818,51 @@ impl AppService {
                 expected.people = Some(people);
             }
 
-            let original_title_lock_supported = self.inner()?.original_title_lock_supported;
+            let unsupported_locks = self.inner()?.unsupported_locks.clone();
             let desired_locks = fields
                 .iter()
                 .map(|field| locked_field_name(*field))
-                .filter(|name| *name != "OriginalTitle" || original_title_lock_supported)
+                .filter(|name| !unsupported_locks.contains(*name))
                 .collect::<Vec<_>>();
             locked_fields = merge_locked_fields(object.get("LockedFields"), &desired_locks);
             object.insert("LockedFields".to_string(), json!(locked_fields));
         }
 
-        match api.update_item(&item.id, &dto).await {
-            Ok(()) => {}
-            Err(first_error) if locked_fields.iter().any(|field| field == "OriginalTitle") => {
-                // The official MetadataField enum has no OriginalTitle (only
-                // Name/Overview/Tags/Cast/...). Some servers reject the whole
-                // DTO; retry without that one lock and remember the limitation.
-                tracing::warn!(
-                    item = %item.id,
-                    error = %first_error,
-                    "Jellyfin rejected LockedFields OriginalTitle; retrying without it"
-                );
-                locked_fields.retain(|field| field != "OriginalTitle");
-                {
-                    let object = dto
-                        .as_object_mut()
-                        .ok_or_else(|| anyhow!("条目 {} 的 DTO 不是 JSON 对象", item.id))?;
-                    object.insert("LockedFields".to_string(), json!(locked_fields));
-                }
-                api.update_item(&item.id, &dto).await.with_context(|| {
-                    format!(
-                        "写回条目 {} 失败（已去掉不支持的 OriginalTitle 锁定后重试）",
-                        item.id
-                    )
-                })?;
-                let mut inner = self.inner()?;
-                inner.original_title_lock_supported = false;
+        if let Err(first_error) = api.update_item(&item.id, &dto).await {
+            let removable = locked_fields
+                .iter()
+                .filter(|name| OPTIONAL_LOCK_FIELDS.contains(&name.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if removable.is_empty() || !is_bad_request(&first_error) {
+                return Err(first_error).with_context(|| format!("写回条目 {} 失败", item.id));
             }
-            Err(error) => {
-                return Err(error).with_context(|| format!("写回条目 {} 失败", item.id));
+
+            // The official MetadataField enum has no OriginalTitle/SortName;
+            // some servers reject the whole DTO with 400. Retry without those
+            // optional locks and remember the limitation for this session.
+            tracing::warn!(
+                item = %item.id,
+                error = %first_error,
+                locks = ?removable,
+                "Jellyfin rejected optional LockedFields; retrying without them"
+            );
+            locked_fields.retain(|name| !removable.iter().any(|removed| removed == name));
+            {
+                let object = dto
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow!("条目 {} 的 DTO 不是 JSON 对象", item.id))?;
+                object.insert("LockedFields".to_string(), json!(locked_fields));
+            }
+            api.update_item(&item.id, &dto).await.with_context(|| {
+                format!(
+                    "写回条目 {} 失败（已去掉不支持的 LockedFields {:?} 后重试）",
+                    item.id, removable
+                )
+            })?;
+            let mut inner = self.inner()?;
+            for field in removable {
+                inner.unsupported_locks.insert(field);
             }
         }
 

@@ -550,7 +550,7 @@ impl AppState {
                 div()
                     .text_size(px(11.5))
                     .text_color(ui::muted(theme))
-                    .child("写回字段：标题 / 原名 / 简介 / 标签 / 演职员。Genres、Studios、Tagline、分级与图片文字暂不翻译。"),
+                    .child("写回字段：标题 / 排序标题 / 原名 / 类型 / 简介 / 标签 / 演职员。Studios、Tagline、分级与图片文字暂不翻译。"),
             );
 
         let data_dir = self
