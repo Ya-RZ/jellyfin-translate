@@ -24,11 +24,23 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 const SYSTEM_PROMPT: &str = concat!(
     "You are a translation engine. The user message is a JSON array of segments, ",
-    "each with an \"id\" (string) and a \"text\" (string). Translate every text into ",
-    "the target language, preserving meaning, names and tone. Respond with ONLY a ",
-    "JSON object of the form {\"segments\":[{\"id\":\"<same id>\",\"text\":\"<translation>\"}]} ",
-    "containing one entry per input segment, in the same order. Do not add ",
-    "commentary, explanations or markdown fences."
+    "each with an \"id\" and a \"text\". Translate every `text` into the target ",
+    "language. Never echo the input unchanged: every segment must receive an actual ",
+    "translation, including tags, short labels and proper nouns. Render proper nouns ",
+    "and brand names following the conventions of the target language. Respond with ",
+    "ONLY a JSON object of the form ",
+    "{\"segments\":[{\"id\":\"<same id>\",\"text\":\"<translation>\"}]} containing one ",
+    "entry per input segment, in the same order. Do not add commentary, explanations ",
+    "or markdown fences."
+);
+
+/// Appended to the system prompt for one retry when the model echoed the input
+/// instead of translating it.
+const ECHO_RETRY_INSTRUCTION: &str = concat!(
+    "Your previous answer copied the input text without translating it. That is not ",
+    "acceptable. Translate every `text` now: do NOT echo the input, even for tags, ",
+    "short labels or names. Only leave a proper noun unchanged when that is the ",
+    "correct form in the target language."
 );
 
 pub struct OpenAiTranslator {
@@ -243,16 +255,31 @@ impl OpenAiTranslator {
 
             let mut last_error: Option<anyhow::Error> = None;
             let mut outcome: Option<(Vec<String>, Option<u64>)> = None;
-            for attempt in 0..MAX_ATTEMPTS {
-                match self.translate_once(&batch_segments, &system_content).await {
-                    Ok(value) => {
-                        outcome = Some(value);
+            let mut error_attempts = 0usize;
+            let mut echo_retried = false;
+            let mut attempt_system = system_content.clone();
+
+            while error_attempts < MAX_ATTEMPTS {
+                match self.translate_once(&batch_segments, &attempt_system).await {
+                    Ok((texts, tokens)) => {
+                        if !echo_retried && is_echo(&batch_segments, &texts) {
+                            echo_retried = true;
+                            tracing::warn!(
+                                provider = "openai",
+                                "model echoed the input unchanged; retrying once with a stronger instruction"
+                            );
+                            attempt_system =
+                                format!("{system_content}\n\n{ECHO_RETRY_INSTRUCTION}");
+                            continue;
+                        }
+                        outcome = Some((texts, tokens));
                         break;
                     }
                     Err(error) => {
+                        error_attempts += 1;
                         tracing::warn!(
                             provider = "openai",
-                            attempt = attempt + 1,
+                            attempt = error_attempts,
                             error = %error,
                             "translation request failed"
                         );
@@ -397,6 +424,15 @@ fn token_count(usage: Option<ChatUsage>) -> Option<u64> {
     })
 }
 
+/// True when the model returned the exact input for every segment in the batch.
+fn is_echo(segments: &[&Segment], texts: &[String]) -> bool {
+    segments.len() == texts.len()
+        && segments
+            .iter()
+            .zip(texts)
+            .all(|(segment, text)| segment.text == *text)
+}
+
 /// Accepts plain JSON as well as common model wrappers such as ```json fences.
 fn extract_json(content: &str) -> &str {
     let trimmed = content.trim();
@@ -414,8 +450,28 @@ fn extract_json(content: &str) -> &str {
         trimmed
     };
 
-    match (unwrapped.find('{'), unwrapped.rfind('}')) {
-        (Some(start), Some(end)) if end > start => &unwrapped[start..=end],
+    // A top-level JSON array (or object) is already complete; slicing it down to
+    // its first/last braces would corrupt arrays like [{"id":..,"text":..}].
+    if serde_json::from_str::<Value>(unwrapped).is_ok() {
+        return unwrapped;
+    }
+
+    let start = [unwrapped.find('{'), unwrapped.find('[')]
+        .into_iter()
+        .flatten()
+        .min();
+    let end = [unwrapped.rfind('}'), unwrapped.rfind(']')]
+        .into_iter()
+        .flatten()
+        .max();
+    match (start, end) {
+        (Some(start), Some(end)) if end > start => {
+            let candidate = &unwrapped[start..=end];
+            if serde_json::from_str::<Value>(candidate).is_ok() {
+                return candidate;
+            }
+            unwrapped
+        }
         _ => unwrapped,
     }
 }
@@ -425,11 +481,12 @@ fn extract_json(content: &str) -> &str {
 /// ignore the requested JSON contract, so the accepted forms are, in order:
 ///
 /// 1. the canonical `{"segments":[{"id":"..","text":".."}]}` payload;
-/// 2. a bare JSON string (`"你好"`);
-/// 3. an object carrying `text` / `translation` / `content` / `result` (or
+/// 2. a top-level array of segment objects (`[{"id":"..","text":".."}]`);
+/// 3. a bare JSON string (`"你好"`);
+/// 4. an object carrying `text` / `translation` / `content` / `result` (or
 ///    `segments`) as a string or as an array of strings;
-/// 4. a top-level array of strings (aligned by position);
-/// 5. for a single input only, the whole cleaned content as plain text.
+/// 5. a top-level array of strings (aligned by position);
+/// 6. for a single input only, the whole cleaned content as plain text.
 fn parse_content(content: &str, expected: &[&Segment]) -> Result<Vec<String>> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -452,7 +509,23 @@ fn parse_content(content: &str, expected: &[&Segment]) -> Result<Vec<String>> {
         }
     }
 
-    // 2-4) JSON string, object with a text-like field, or array of strings.
+    // 2) Top-level array of segment objects, e.g. the model echoed the input as
+    //    [{"id":"tag:0","text":"prestigepremium"}, ...]. IDs may be strings or
+    //    numbers; missing IDs fall back to positional order.
+    if let Ok(raw) = serde_json::from_str::<Vec<RawSegment>>(json_text) {
+        if !raw.is_empty() {
+            match align(expected, raw) {
+                Ok(texts) => return Ok(texts),
+                Err(error) => tracing::debug!(
+                    provider = "openai",
+                    %error,
+                    "top-level segment array did not align; trying tolerant shapes"
+                ),
+            }
+        }
+    }
+
+    // 3-5) JSON string, object with a text-like field, or array of strings.
     if let Ok(value) = serde_json::from_str::<Value>(json_text) {
         if let Some(texts) = texts_from_value(&value, expected.len()) {
             return Ok(texts);
@@ -460,7 +533,7 @@ fn parse_content(content: &str, expected: &[&Segment]) -> Result<Vec<String>> {
         return Err(unparsable(trimmed, expected.len()));
     }
 
-    // 5) Not JSON at all: with a single input the cleaned content is the
+    // 6) Not JSON at all: with a single input the cleaned content is the
     //    translation (models often answer with just the translated string).
     if expected.len() == 1 {
         let cleaned = clean_plain_text(trimmed);
@@ -621,6 +694,37 @@ mod tests {
                 "choices": [{ "message": { "role": "assistant", "content": content } }]
             }));
         })
+    }
+
+    fn tag_segments() -> Vec<Segment> {
+        vec![
+            Segment {
+                id: "tag:0".to_owned(),
+                text: "prestigepremium".to_owned(),
+            },
+            Segment {
+                id: "tag:1".to_owned(),
+                text: "premium".to_owned(),
+            },
+            Segment {
+                id: "tag:2".to_owned(),
+                text: "prestige".to_owned(),
+            },
+        ]
+    }
+
+    const ECHO_RETRY_MARKER: &str = "previous answer copied the input text";
+
+    fn request_body(request: &HttpMockRequest) -> String {
+        String::from_utf8_lossy(request.body.as_deref().unwrap_or_default()).into_owned()
+    }
+
+    fn first_attempt(request: &HttpMockRequest) -> bool {
+        !request_body(request).contains(ECHO_RETRY_MARKER)
+    }
+
+    fn echo_retry_attempt(request: &HttpMockRequest) -> bool {
+        request_body(request).contains(ECHO_RETRY_MARKER)
     }
 
     #[tokio::test]
@@ -794,6 +898,103 @@ mod tests {
         assert_eq!(response.segments[0].text, "你好");
         assert_eq!(response.segments[1].id, "s2");
         assert_eq!(response.segments[1].text, "世界");
+    }
+
+    #[tokio::test]
+    async fn accepts_top_level_object_array_aligned_by_id() {
+        let server = MockServer::start();
+        let mock = mock_chat(
+            &server,
+            r#"[{"id":"tag:2","text":"声望"},{"id":"tag:0","text":"名牌溢价"},{"id":"tag:1","text":"溢价"}]"#,
+        );
+
+        let response = translator(&server)
+            .translate(request(tag_segments()))
+            .await
+            .unwrap();
+
+        mock.assert_hits(1);
+        assert_eq!(response.segments.len(), 3);
+        assert_eq!(response.segments[0].id, "tag:0");
+        assert_eq!(response.segments[0].text, "名牌溢价");
+        assert_eq!(response.segments[1].id, "tag:1");
+        assert_eq!(response.segments[1].text, "溢价");
+        assert_eq!(response.segments[2].id, "tag:2");
+        assert_eq!(response.segments[2].text, "声望");
+    }
+
+    #[tokio::test]
+    async fn accepts_top_level_object_array_without_ids_by_position() {
+        let server = MockServer::start();
+        let mock = mock_chat(&server, r#"[{"text":"你好"},{"text":"世界"}]"#);
+
+        let response = translator(&server)
+            .translate(request(segments()))
+            .await
+            .unwrap();
+
+        mock.assert_hits(1);
+        assert_eq!(response.segments[0].id, "s1");
+        assert_eq!(response.segments[0].text, "你好");
+        assert_eq!(response.segments[1].id, "s2");
+        assert_eq!(response.segments[1].text, "世界");
+    }
+
+    #[tokio::test]
+    async fn retries_once_with_stronger_instruction_when_model_echoes() {
+        let server = MockServer::start();
+        let echo = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(first_attempt);
+            then.status(200).json_body(json!({
+                "choices": [{ "message": {
+                    "content": r#"[{"id":"tag:0","text":"prestigepremium"},{"id":"tag:1","text":"premium"},{"id":"tag:2","text":"prestige"}]"#
+                }}]
+            }));
+        });
+        let retry = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(echo_retry_attempt);
+            then.status(200).json_body(json!({
+                "choices": [{ "message": {
+                    "content": r#"[{"id":"tag:0","text":"名牌溢价"},{"id":"tag:1","text":"溢价"},{"id":"tag:2","text":"声望"}]"#
+                }}]
+            }));
+        });
+
+        let response = translator(&server)
+            .translate(request(tag_segments()))
+            .await
+            .unwrap();
+
+        echo.assert_hits(1);
+        retry.assert_hits(1);
+        assert_eq!(response.segments[0].text, "名牌溢价");
+        assert_eq!(response.segments[1].text, "溢价");
+        assert_eq!(response.segments[2].text, "声望");
+    }
+
+    #[tokio::test]
+    async fn returns_echoed_text_when_retry_also_echoes() {
+        let server = MockServer::start();
+        let mock = mock_chat(
+            &server,
+            r#"{"segments":[{"id":"s1","text":"prestigepremium"}]}"#,
+        );
+
+        let response = translator(&server)
+            .translate(request(vec![Segment {
+                id: "s1".to_owned(),
+                text: "prestigepremium".to_owned(),
+            }]))
+            .await
+            .expect("an echoed batch must be returned instead of failing");
+
+        mock.assert_hits(2);
+        assert_eq!(response.segments.len(), 1);
+        assert_eq!(response.segments[0].text, "prestigepremium");
     }
 
     #[tokio::test]
