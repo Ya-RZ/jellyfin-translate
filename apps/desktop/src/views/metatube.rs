@@ -1,6 +1,6 @@
 //! 视频元数据抓取弹窗（MetaTube）。
 //!
-//! 抽屉里点「抓取元数据」→ 本弹窗预填原名 → 搜索候选 → 选一条取详情 →
+//! 抽屉里点「抓取元数据」→ 本弹窗预填标题 → 搜索候选 → 选一条取详情 →
 //! 结果直接填进本地草稿并打开编辑弹窗，由用户确认后再写回 Jellyfin。
 
 use ::core::MovieSearchResult;
@@ -72,10 +72,12 @@ impl AppState {
             return;
         }
 
-        let keyword = if item.original_title.trim().is_empty() {
-            item.title.trim().to_string()
-        } else {
+        // Default the keyword to the item's title (already translated), falling
+        // back to the original title only when the title is empty.
+        let keyword = if item.title.trim().is_empty() {
             item.original_title.trim().to_string()
+        } else {
+            item.title.trim().to_string()
         };
 
         self.metatube.item_id = Some(item_id);
@@ -352,7 +354,7 @@ impl AppState {
                     .w_full()
                     .text_size(px(12.))
                     .text_color(ui::muted(theme))
-                    .child("输入关键词后点「搜索」。默认用条目的原名；原名通常就是番号。"),
+                    .child("输入关键词后点「搜索」。默认用条目的标题；标题里带番号时可直接搜。"),
             );
         }
 
