@@ -529,7 +529,11 @@ async fn translate_stores_drafts_uses_presets_and_skips_locked() {
     );
     let service = synced_service(&fake).await;
     service
-        .upsert_preset("  leonardo dicaprio ", "莱昂纳多·迪卡普里奥")
+        .upsert_preset(
+            PresetKind::Person,
+            "  leonardo dicaprio ",
+            "莱昂纳多·迪卡普里奥",
+        )
         .unwrap();
 
     let translator = EchoTranslator::new();
@@ -798,16 +802,55 @@ async fn write_back_requires_a_connection() {
 }
 
 #[tokio::test]
-async fn presets_crud_roundtrip() {
+async fn presets_crud_roundtrip_per_kind() {
     let service = AppService::open_in_memory().unwrap();
-    service.upsert_preset(" Tom Hanks ", "汤姆·汉克斯").unwrap();
-    service.upsert_preset("tom hanks", "汤姆汉克斯").unwrap();
+    service
+        .upsert_preset(PresetKind::Person, " Tom Hanks ", "汤姆·汉克斯")
+        .unwrap();
+    // Same kind + normalized source updates the existing entry.
+    service
+        .upsert_preset(PresetKind::Person, "tom hanks", "汤姆汉克斯")
+        .unwrap();
+    // Same source under other kinds is a separate entry.
+    service
+        .upsert_preset(PresetKind::Tag, "Tom Hanks", "汉克斯标签")
+        .unwrap();
+    service
+        .upsert_preset(PresetKind::Genre, "Drama", "剧情")
+        .unwrap();
+
+    let presets = service.presets().unwrap();
+    assert_eq!(presets.len(), 3);
+    let person = presets
+        .iter()
+        .find(|preset| preset.kind == PresetKind::Person)
+        .unwrap();
+    assert_eq!(person.target, "汤姆汉克斯");
+
+    service
+        .delete_preset(PresetKind::Tag, " tom hanks")
+        .unwrap();
+    let presets = service.presets().unwrap();
+    assert_eq!(presets.len(), 2);
+    assert!(presets.iter().all(|preset| preset.kind != PresetKind::Tag));
+
+    service
+        .delete_preset(PresetKind::Person, "TOM HANKS")
+        .unwrap();
     let presets = service.presets().unwrap();
     assert_eq!(presets.len(), 1);
-    assert_eq!(presets[0].target, "汤姆汉克斯");
+    assert_eq!(presets[0].kind, PresetKind::Genre);
 
-    service.delete_preset(" TOM HANKS").unwrap();
-    assert!(service.presets().unwrap().is_empty());
+    // Serde shape used by the UI.
+    assert_eq!(
+        serde_json::to_value(PresetKind::Person).unwrap(),
+        json!("person")
+    );
+    assert_eq!(serde_json::to_value(PresetKind::Tag).unwrap(), json!("tag"));
+    assert_eq!(
+        serde_json::to_value(PresetKind::Genre).unwrap(),
+        json!("genre")
+    );
 }
 
 #[tokio::test]
@@ -1367,7 +1410,11 @@ async fn translate_preview_returns_values_without_writing_the_store() {
     );
     let service = synced_service(&fake).await;
     service
-        .upsert_preset("  leonardo dicaprio ", "莱昂纳多·迪卡普里奥")
+        .upsert_preset(
+            PresetKind::Person,
+            "  leonardo dicaprio ",
+            "莱昂纳多·迪卡普里奥",
+        )
         .unwrap();
     service.install_translator(EchoTranslator::new()).unwrap();
 
@@ -1877,4 +1924,93 @@ async fn empty_drafts_are_written_and_locked() {
         service.items("movies").unwrap()[0].status,
         TranslationStatus::Written
     );
+}
+
+#[tokio::test]
+async fn presets_are_scoped_by_kind_and_hits_skip_the_provider() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    let service = synced_service(&fake).await;
+
+    service
+        .upsert_preset(
+            PresetKind::Person,
+            "Leonardo DiCaprio",
+            "莱昂纳多·迪卡普里奥",
+        )
+        .unwrap();
+    service
+        .upsert_preset(PresetKind::Tag, "Sci-Fi", "科幻")
+        .unwrap();
+    service
+        .upsert_preset(PresetKind::Genre, "Drama", "剧情")
+        .unwrap();
+    // Wrong-kind entries must never be applied across categories.
+    service
+        .upsert_preset(PresetKind::Tag, "Drama", "错误标签")
+        .unwrap();
+    service
+        .upsert_preset(PresetKind::Genre, "Sci-Fi", "错误类型")
+        .unwrap();
+    service
+        .upsert_preset(PresetKind::Tag, "Tom Hanks", "标签汤姆")
+        .unwrap();
+
+    let translator = EchoTranslator::new();
+    service.install_translator(translator.clone()).unwrap();
+
+    let report = service
+        .translate_fields(
+            "m1",
+            vec![FieldKind::Tags, FieldKind::Genres, FieldKind::People],
+            templates(),
+            settings(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.translated, 1);
+    assert!(report.failed.is_empty());
+
+    let item = service.items("movies").unwrap().remove(0);
+    // Tag preset hit + normal translation of the miss.
+    assert_eq!(
+        item.tags,
+        vec!["科幻".to_string(), "[zh-CN] Heist".to_string()]
+    );
+    // Genre preset hit; the Tag preset for "Drama" must not leak in.
+    assert_eq!(item.genres, vec!["剧情".to_string()]);
+    // Person preset hit; the Tag preset for "Tom Hanks" must not apply.
+    assert_eq!(item.people[0].name, "莱昂纳多·迪卡普里奥");
+    assert_eq!(item.people[1].name, "[zh-CN] Tom Hanks");
+    assert_eq!(item.people[1].role.as_deref(), Some("[zh-CN] Narrator"));
+
+    // Preset hits were not sent to the provider: only misses appear in prompts,
+    // and the all-hit Genres field made no provider call at all.
+    let prompts = translator.prompts();
+    assert_eq!(prompts.len(), 2, "tags miss + people miss: {prompts:?}");
+    let joined = prompts.join("\n");
+    assert!(!joined.contains("Sci-Fi"));
+    assert!(!joined.contains("Drama"));
+    assert!(!joined.contains("Leonardo DiCaprio"));
+    assert!(joined.contains("Heist"));
+    assert!(joined.contains("Tom Hanks"));
+
+    // Usage counters are independent per kind and only bumped for real hits.
+    let uses = |kind: PresetKind, source: &str| {
+        service
+            .presets()
+            .unwrap()
+            .into_iter()
+            .find(|preset| preset.kind == kind && preset.source.eq_ignore_ascii_case(source))
+            .map(|preset| preset.uses)
+            .unwrap()
+    };
+    assert_eq!(uses(PresetKind::Person, "Leonardo DiCaprio"), 1);
+    assert_eq!(uses(PresetKind::Tag, "Sci-Fi"), 1);
+    assert_eq!(uses(PresetKind::Genre, "Drama"), 1);
+    assert_eq!(uses(PresetKind::Tag, "Drama"), 0);
+    assert_eq!(uses(PresetKind::Genre, "Sci-Fi"), 0);
+    assert_eq!(uses(PresetKind::Tag, "Tom Hanks"), 0);
 }

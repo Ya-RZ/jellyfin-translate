@@ -160,6 +160,7 @@ pub struct ItemDraft {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PresetRecord {
+    pub kind: String,
     pub source: String,
     pub target: String,
     pub uses: i64,
@@ -264,13 +265,12 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS presets (
-                source TEXT PRIMARY KEY,
+                kind   TEXT NOT NULL DEFAULT 'person',
+                source TEXT NOT NULL,
                 target TEXT NOT NULL,
-                uses   INTEGER NOT NULL DEFAULT 0
+                uses   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (kind, source)
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_presets_normalized
-                ON presets(lower(trim(source)));
-
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -282,6 +282,11 @@ impl Store {
         // `CREATE TABLE IF NOT EXISTS` for the new tables, so add the columns
         // explicitly. `pragma_table_info` is a table-valued function (SQLite
         // 3.16+) and lets us keep this idempotent.
+        self.migrate_presets()?;
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_presets_normalized
+                ON presets(kind, lower(trim(source)))",
+        )?;
         self.ensure_column("libraries", "visible", "INTEGER NOT NULL DEFAULT 1")?;
         for (column, decl) in [
             ("status", "TEXT NOT NULL DEFAULT 'untranslated'"),
@@ -297,6 +302,35 @@ impl Store {
             ("draft_people_json", "TEXT"),
         ] {
             self.ensure_column("items", column, decl)?;
+        }
+        Ok(())
+    }
+
+    /// Older databases keyed presets by `source` alone. Rebuild the table with
+    /// the `(kind, source)` key, defaulting every existing row to `person`.
+    fn migrate_presets(&self) -> Result<()> {
+        let has_kind: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('presets') WHERE name = 'kind'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_kind == 0 {
+            self.conn.execute_batch(
+                r#"
+                DROP INDEX IF EXISTS idx_presets_normalized;
+                CREATE TABLE presets_new (
+                    kind   TEXT NOT NULL DEFAULT 'person',
+                    source TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    uses   INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (kind, source)
+                );
+                INSERT INTO presets_new (kind, source, target, uses)
+                    SELECT 'person', source, target, uses FROM presets;
+                DROP TABLE presets;
+                ALTER TABLE presets_new RENAME TO presets;
+                "#,
+            )?;
         }
         Ok(())
     }
@@ -628,14 +662,16 @@ impl Store {
     // ------------------------------------------------------------------ presets
 
     pub fn presets(&self) -> Result<Vec<PresetRecord>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT source, target, uses FROM presets ORDER BY source COLLATE NOCASE")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, source, target, uses FROM presets
+             ORDER BY kind, source COLLATE NOCASE",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(PresetRecord {
-                source: row.get(0)?,
-                target: row.get(1)?,
-                uses: row.get(2)?,
+                kind: row.get(0)?,
+                source: row.get(1)?,
+                target: row.get(2)?,
+                uses: row.get(3)?,
             })
         })?;
         let mut out = Vec::new();
@@ -645,51 +681,53 @@ impl Store {
         Ok(out)
     }
 
-    /// Insert or update a preset. Matching ignores case and leading/trailing
-    /// whitespace so `" Tom Hanks "` and `"tom hanks"` are the same entry.
-    /// An existing entry keeps its use counter.
-    pub fn upsert_preset(&mut self, source: &str, target: &str) -> Result<()> {
+    /// Insert or update a preset for one kind. Matching ignores case and
+    /// leading/trailing whitespace so `" Tom Hanks "` and `"tom hanks"` are the
+    /// same entry. An existing entry keeps its use counter.
+    pub fn upsert_preset(&mut self, kind: &str, source: &str, target: &str) -> Result<()> {
+        let kind = kind.trim();
         let source = source.trim();
         let target = target.trim();
+        anyhow::ensure!(!kind.is_empty(), "preset kind must not be empty");
         anyhow::ensure!(!source.is_empty(), "preset source must not be empty");
         anyhow::ensure!(!target.is_empty(), "preset target must not be empty");
 
         let tx = self.conn.transaction()?;
         let changed = tx.execute(
-            "UPDATE presets SET source = ?1, target = ?2
-             WHERE lower(trim(source)) = lower(trim(?1))",
-            params![source, target],
+            "UPDATE presets SET source = ?2, target = ?3
+             WHERE kind = ?1 AND lower(trim(source)) = lower(trim(?2))",
+            params![kind, source, target],
         )?;
         if changed == 0 {
             tx.execute(
-                "INSERT INTO presets (source, target, uses) VALUES (?1, ?2, 0)",
-                params![source, target],
+                "INSERT INTO presets (kind, source, target, uses) VALUES (?1, ?2, ?3, 0)",
+                params![kind, source, target],
             )?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    pub fn delete_preset(&mut self, source: &str) -> Result<usize> {
+    pub fn delete_preset(&mut self, kind: &str, source: &str) -> Result<usize> {
         Ok(self.conn.execute(
-            "DELETE FROM presets WHERE lower(trim(source)) = lower(trim(?1))",
-            params![source],
+            "DELETE FROM presets WHERE kind = ?1 AND lower(trim(source)) = lower(trim(?2))",
+            params![kind.trim(), source],
         )?)
     }
 
-    /// Count how often each preset name was actually applied.
-    pub fn increment_preset_uses(&mut self, sources: &[String]) -> Result<()> {
-        if sources.is_empty() {
+    /// Count how often each `(kind, source)` preset was actually applied.
+    pub fn increment_preset_uses(&mut self, uses: &[(String, String)]) -> Result<()> {
+        if uses.is_empty() {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
                 "UPDATE presets SET uses = uses + 1
-                 WHERE lower(trim(source)) = lower(trim(?1))",
+                 WHERE kind = ?1 AND lower(trim(source)) = lower(trim(?2))",
             )?;
-            for source in sources {
-                stmt.execute([source])?;
+            for (kind, source) in uses {
+                stmt.execute(params![kind, source])?;
             }
         }
         tx.commit()?;
@@ -913,25 +951,95 @@ mod tests {
     }
 
     #[test]
-    fn presets_match_ignoring_case_and_space() {
+    fn presets_match_ignoring_case_and_space_per_kind() {
         let mut store = Store::open_in_memory().unwrap();
-        store.upsert_preset("Tom Hanks", "汤姆·汉克斯").unwrap();
-        store.upsert_preset(" tom hanks ", "汤姆·汉克斯").unwrap();
+        store
+            .upsert_preset("person", "Tom Hanks", "汤姆·汉克斯")
+            .unwrap();
+        store
+            .upsert_preset("person", " tom hanks ", "汤姆·汉克斯")
+            .unwrap();
         let presets = store.presets().unwrap();
         assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].kind, "person");
         assert_eq!(presets[0].uses, 0);
 
-        store.increment_preset_uses(&["TOM HANKS".into()]).unwrap();
+        store
+            .increment_preset_uses(&[("person".into(), "TOM HANKS".into())])
+            .unwrap();
         assert_eq!(store.presets().unwrap()[0].uses, 1);
 
-        // Updating the target keeps the counter.
-        store.upsert_preset("Tom Hanks", "汤姆汉克斯").unwrap();
-        let presets = store.presets().unwrap();
-        assert_eq!(presets[0].target, "汤姆汉克斯");
-        assert_eq!(presets[0].uses, 1);
+        // The same source can coexist under a different kind.
+        store.upsert_preset("tag", "tom hanks", "标签译名").unwrap();
+        assert_eq!(store.presets().unwrap().len(), 2);
 
-        store.delete_preset(" tom hanks").unwrap();
-        assert!(store.presets().unwrap().is_empty());
+        // Updating the target keeps the counter, per kind.
+        store
+            .upsert_preset("person", "Tom Hanks", "汤姆汉克斯")
+            .unwrap();
+        let person = store
+            .presets()
+            .unwrap()
+            .into_iter()
+            .find(|preset| preset.kind == "person")
+            .unwrap();
+        assert_eq!(person.target, "汤姆汉克斯");
+        assert_eq!(person.uses, 1);
+
+        store
+            .increment_preset_uses(&[("tag".into(), " TOM HANKS ".into())])
+            .unwrap();
+        let presets = store.presets().unwrap();
+        let tag = presets.iter().find(|preset| preset.kind == "tag").unwrap();
+        assert_eq!(tag.uses, 1);
+        let person = presets
+            .iter()
+            .find(|preset| preset.kind == "person")
+            .unwrap();
+        assert_eq!(person.uses, 1);
+
+        // Deleting one kind leaves the other untouched.
+        store.delete_preset("tag", " tom hanks").unwrap();
+        let presets = store.presets().unwrap();
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].kind, "person");
+    }
+
+    #[test]
+    fn migrates_old_presets_to_person() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE presets (
+                    source TEXT PRIMARY KEY,
+                    target TEXT NOT NULL,
+                    uses   INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO presets VALUES ('Tom Hanks', '汤姆·汉克斯', 7);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(&path).unwrap();
+        let presets = store.presets().unwrap();
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].kind, "person");
+        assert_eq!(presets[0].source, "Tom Hanks");
+        assert_eq!(presets[0].uses, 7);
+
+        // The rebuilt (kind, source) key allows the same source under Tag.
+        store.upsert_preset("tag", "Tom Hanks", "标签译名").unwrap();
+        assert_eq!(store.presets().unwrap().len(), 2);
+
+        // And the new unique index still dedupes per kind (case/space).
+        store
+            .upsert_preset("person", " tom hanks ", "新译名")
+            .unwrap();
+        assert_eq!(store.presets().unwrap().len(), 2);
     }
 
     #[test]

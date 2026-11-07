@@ -1,6 +1,6 @@
 //! 演员预设页：表格、搜索、添加与删除。
 
-use ::core::Preset;
+use ::core::{Preset, PresetKind};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{h_flex, v_flex, Sizable as _, Theme};
@@ -9,8 +9,17 @@ use gpui_kit::*;
 use crate::app::AppState;
 use crate::ui;
 
+pub(crate) fn preset_kind_label(kind: PresetKind) -> &'static str {
+    match kind {
+        PresetKind::Person => "演员姓名",
+        PresetKind::Tag => "标签",
+        PresetKind::Genre => "类型",
+    }
+}
+
 pub(crate) struct PresetsState {
     pub(crate) rows: Vec<Preset>,
+    pub(crate) active_kind: PresetKind,
     pub(crate) search: Entity<InputState>,
     pub(crate) new_source: Entity<InputState>,
     pub(crate) new_target: Entity<InputState>,
@@ -23,11 +32,12 @@ impl PresetsState {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<AppState>) -> Self {
         Self {
             rows: Vec::new(),
-            search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索演员…")),
-            new_source: cx
-                .new(|cx| InputState::new(window, cx).placeholder("演员原文名，例如 Tim Robbins")),
-            new_target: cx
-                .new(|cx| InputState::new(window, cx).placeholder("预设译名，例如 蒂姆·罗宾斯")),
+            active_kind: PresetKind::Person,
+            search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索预设…")),
+            new_source: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("原文（演员姓名 / 标签 / 类型）")
+            }),
+            new_target: cx.new(|cx| InputState::new(window, cx).placeholder("预设译名")),
             loaded: false,
             loading: false,
             error: None,
@@ -68,16 +78,17 @@ impl AppState {
         let source = self.presets.new_source.read(cx).value().trim().to_string();
         let target = self.presets.new_target.read(cx).value().trim().to_string();
         if source.is_empty() || target.is_empty() {
-            self.notify_toast("请填写演员原文名与预设译名", cx);
+            self.notify_toast("请填写原文与预设译名", cx);
             return;
         }
+        let kind = self.presets.active_kind;
 
         self.spawn_job_in(
             window,
             cx,
             move |service| {
                 service
-                    .upsert_preset(&source, &target)
+                    .upsert_preset(kind, &source, &target)
                     .map_err(ui::error_text)
             },
             |this, result, window, cx| {
@@ -99,11 +110,11 @@ impl AppState {
         );
     }
 
-    fn delete_preset(&mut self, source: String, cx: &mut Context<Self>) {
+    fn delete_preset(&mut self, kind: PresetKind, source: String, cx: &mut Context<Self>) {
         let label = source.clone();
         self.spawn_job(
             cx,
-            move |service| service.delete_preset(&source).map_err(ui::error_text),
+            move |service| service.delete_preset(kind, &source).map_err(ui::error_text),
             move |this, result, cx| {
                 match result {
                     Ok(()) => {
@@ -118,12 +129,14 @@ impl AppState {
     }
 
     pub(crate) fn render_presets(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let active_kind = self.presets.active_kind;
         let search = self.presets.search.read(cx).value().to_lowercase();
         let needle = search.trim();
         let visible = self
             .presets
             .rows
             .iter()
+            .filter(|preset| preset.kind == active_kind)
             .filter(|preset| {
                 needle.is_empty()
                     || preset.source.to_lowercase().contains(needle)
@@ -149,14 +162,15 @@ impl AppState {
             .items_center()
             .border_b_1()
             .border_color(ui::border(theme))
-            .child(header_cell("原文名", None))
-            .child(header_cell("预设译名", None))
+            .child(header_cell("原文", None))
+            .child(header_cell("译文", None))
             .child(header_cell("使用次数", Some(px(120.))))
             .child(div().w(px(96.)).flex_shrink_0().child(div()));
 
         let rows = visible.iter().map(|preset| {
             let source = preset.source.clone();
             let delete_source = preset.source.clone();
+            let kind = active_kind;
             h_flex()
                 .w_full()
                 .px(px(12.))
@@ -191,12 +205,12 @@ impl AppState {
                 )
                 .child(
                     div().w(px(96.)).flex_shrink_0().child(
-                        Button::new(format!("preset-delete-{source}"))
+                        Button::new(format!("preset-delete-{:?}-{source}", kind))
                             .small()
                             .ghost()
                             .label("删除")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.delete_preset(delete_source.clone(), cx)
+                                this.delete_preset(kind, delete_source.clone(), cx)
                             })),
                     ),
                 )
@@ -211,7 +225,7 @@ impl AppState {
                 .child(if self.presets.loading {
                     "正在读取预设…".to_string()
                 } else if needle.is_empty() {
-                    "还没有演员预设".to_string()
+                    format!("还没有{}预设", preset_kind_label(active_kind))
                 } else {
                     "没有匹配项".to_string()
                 })
@@ -233,12 +247,65 @@ impl AppState {
                     .pt(px(22.))
                     .pb(px(16.))
                     .child(ui::page_head(
-                        "演员预设",
-                        "演员姓名完全匹配时直接采用预设译名；角色名不套用",
+                        "翻译预设",
+                        "演员姓名、标签、类型三类预设：翻译时完全匹配即直接替换；角色名不套用",
                         theme,
                     ))
                     .child(div().flex_1())
                     .child(Input::new(&self.presets.search).w(px(220.))),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap(px(4.))
+                    .border_b_1()
+                    .border_color(ui::border(theme))
+                    .mb(px(14.))
+                    .children([PresetKind::Person, PresetKind::Tag, PresetKind::Genre].map(
+                        |kind| {
+                            let active = active_kind == kind;
+                            let count = self
+                                .presets
+                                .rows
+                                .iter()
+                                .filter(|preset| preset.kind == kind)
+                                .count();
+                            h_flex()
+                                .id(format!("preset-tab-{:?}", kind))
+                                .gap(px(6.))
+                                .px(px(14.))
+                                .py(px(9.))
+                                .border_b_2()
+                                .border_color(if active {
+                                    ui::accent()
+                                } else {
+                                    ui::transparent()
+                                })
+                                .cursor_pointer()
+                                .text_size(px(13.))
+                                .text_color(if active {
+                                    theme.foreground
+                                } else {
+                                    ui::muted(theme)
+                                })
+                                .font_weight(if active {
+                                    gpui_kit::FontWeight::SEMIBOLD
+                                } else {
+                                    gpui_kit::FontWeight::NORMAL
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.presets.active_kind = kind;
+                                    cx.notify();
+                                }))
+                                .child(preset_kind_label(kind))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(ui::muted(theme))
+                                        .child(count.to_string()),
+                                )
+                        },
+                    )),
             )
             .child(
                 ui::card(theme).p(px(14.)).mb(px(14.)).child(
@@ -274,7 +341,7 @@ impl AppState {
                     .mt(px(10.))
                     .text_size(px(11.5))
                     .text_color(ui::muted(theme))
-                    .child("翻译演职员时先查本表；命中直接用预设值，未命中才交给翻译服务。"),
+                    .child("演员姓名 / 标签 / 类型分别使用各自的预设；完全匹配（忽略大小写与首尾空格）直接采用译文，未命中才交给翻译服务。"),
             );
 
         if let Some(error) = self.presets.error.as_ref() {

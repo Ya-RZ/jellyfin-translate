@@ -40,7 +40,7 @@ impl Page {
         match self {
             Page::Library => "媒体库",
             Page::Tasks => "任务中心",
-            Page::Presets => "演员预设",
+            Page::Presets => "翻译预设",
             Page::Settings => "设置",
             Page::Connect => "连接服务器",
         }
@@ -662,7 +662,7 @@ impl AppState {
             .child(nav_item(
                 Page::Presets,
                 "☺",
-                "演员预设",
+                "翻译预设",
                 Some(self.presets.rows.len()),
             ))
             .child(

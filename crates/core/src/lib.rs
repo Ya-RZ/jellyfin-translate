@@ -174,8 +174,18 @@ impl Default for ProviderSettings {
     }
 }
 
+/// Category of a translation preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresetKind {
+    Person,
+    Tag,
+    Genre,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preset {
+    pub kind: PresetKind,
     pub source: String,
     pub target: String,
     pub uses: i64,
@@ -792,14 +802,14 @@ impl AppService {
             let inner = self.inner()?;
             inner.store.presets()?
         };
-        let preset_map = preset_lookup(&presets);
+        let preset_lookup = preset_lookup(&presets);
         let outcome = translate_item(
             translator.as_ref(),
             &item,
             &fields,
             &templates,
             &settings,
-            &preset_map,
+            &preset_lookup,
         )
         .await?;
 
@@ -843,7 +853,7 @@ impl AppService {
             }
             inner.store.presets()?
         };
-        let preset_map = preset_lookup(&presets);
+        let preset_lookup = preset_lookup(&presets);
 
         let mut report = TranslateReport {
             translated: 0,
@@ -856,7 +866,15 @@ impl AppService {
                 tracing::debug!(item = %item.id, "skip locked item");
                 continue;
             }
-            match translate_item(translator, &item, fields, templates, settings, &preset_map).await
+            match translate_item(
+                translator,
+                &item,
+                fields,
+                templates,
+                settings,
+                &preset_lookup,
+            )
+            .await
             {
                 Ok(outcome) => {
                     {
@@ -870,7 +888,7 @@ impl AppService {
                             fields,
                         )?;
                     }
-                    used_presets.extend(outcome.preset_sources);
+                    used_presets.extend(outcome.preset_uses);
                     report.translated += 1;
                 }
                 Err(error) => {
@@ -881,8 +899,12 @@ impl AppService {
         }
 
         if !used_presets.is_empty() {
+            let uses = used_presets
+                .iter()
+                .map(|(kind, source)| (preset_kind_str(*kind).to_string(), source.clone()))
+                .collect::<Vec<_>>();
             let mut inner = self.inner()?;
-            inner.store.increment_preset_uses(&used_presets)?;
+            inner.store.increment_preset_uses(&uses)?;
         }
         Ok(report)
     }
@@ -988,15 +1010,17 @@ impl AppService {
             .collect())
     }
 
-    pub fn upsert_preset(&self, source: &str, target: &str) -> Result<()> {
+    pub fn upsert_preset(&self, kind: PresetKind, source: &str, target: &str) -> Result<()> {
         let mut inner = self.inner()?;
-        inner.store.upsert_preset(source, target)?;
+        inner
+            .store
+            .upsert_preset(preset_kind_str(kind), source, target)?;
         Ok(())
     }
 
-    pub fn delete_preset(&self, source: &str) -> Result<()> {
+    pub fn delete_preset(&self, kind: PresetKind, source: &str) -> Result<()> {
         let mut inner = self.inner()?;
-        inner.store.delete_preset(source)?;
+        inner.store.delete_preset(preset_kind_str(kind), source)?;
         Ok(())
     }
 
@@ -1233,9 +1257,26 @@ fn parse_status(raw: &str) -> TranslationStatus {
 
 fn preset_view(record: PresetRecord) -> Preset {
     Preset {
+        kind: parse_preset_kind(&record.kind),
         source: record.source,
         target: record.target,
         uses: record.uses,
+    }
+}
+
+fn preset_kind_str(kind: PresetKind) -> &'static str {
+    match kind {
+        PresetKind::Person => "person",
+        PresetKind::Tag => "tag",
+        PresetKind::Genre => "genre",
+    }
+}
+
+fn parse_preset_kind(raw: &str) -> PresetKind {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "tag" => PresetKind::Tag,
+        "genre" => PresetKind::Genre,
+        _ => PresetKind::Person,
     }
 }
 
@@ -1276,8 +1317,8 @@ fn merge_people(existing: &[PersonRecord], edit: Vec<PersonView>) -> Vec<PersonR
 
 struct TranslateOutcome {
     draft: ItemDraft,
-    /// Preset source names that were applied, for the usage counter.
-    preset_sources: Vec<String>,
+    /// `(kind, source)` presets that were applied, for the usage counter.
+    preset_uses: Vec<(PresetKind, String)>,
 }
 
 async fn translate_item(
@@ -1286,7 +1327,7 @@ async fn translate_item(
     fields: &[FieldKind],
     templates: &Templates,
     settings: &ProviderSettings,
-    presets: &HashMap<String, String>,
+    presets: &PresetLookup,
 ) -> Result<TranslateOutcome> {
     // Start from the current effective values so fields that are not selected
     // keep whatever draft (or source text) they already had.
@@ -1299,7 +1340,7 @@ async fn translate_item(
         tags: item.effective_tags().to_vec(),
         people: item.effective_people().to_vec(),
     };
-    let mut preset_sources = Vec::new();
+    let mut preset_uses = Vec::new();
 
     if fields.contains(&FieldKind::Title) {
         let source = source_text(&item.name, &item.draft_name);
@@ -1335,9 +1376,18 @@ async fn translate_item(
         } else {
             item.genres.clone()
         };
-        draft.genres = translate_tags(translator, &source_genres, templates, settings)
-            .await
-            .context("翻译类型失败")?;
+        let (genres, used) = translate_values(
+            translator,
+            &source_genres,
+            &presets.genre,
+            &templates.tags,
+            settings,
+            "genres",
+        )
+        .await
+        .context("翻译类型失败")?;
+        draft.genres = genres;
+        preset_uses.extend(used.into_iter().map(|source| (PresetKind::Genre, source)));
     }
 
     if fields.contains(&FieldKind::Overview) {
@@ -1359,7 +1409,18 @@ async fn translate_item(
         } else {
             item.tags.clone()
         };
-        draft.tags = translate_tags(translator, &source_tags, templates, settings).await?;
+        let (tags, used) = translate_values(
+            translator,
+            &source_tags,
+            &presets.tag,
+            &templates.tags,
+            settings,
+            "tags",
+        )
+        .await
+        .context("翻译标签失败")?;
+        draft.tags = tags;
+        preset_uses.extend(used.into_iter().map(|source| (PresetKind::Tag, source)));
     }
 
     if fields.contains(&FieldKind::People) {
@@ -1368,16 +1429,24 @@ async fn translate_item(
         } else {
             item.people.clone()
         };
-        let people =
-            translate_people(translator, &source_people, templates, settings, presets).await?;
+        let people = translate_people(
+            translator,
+            &source_people,
+            &presets.person,
+            templates,
+            settings,
+        )
+        .await?;
         draft.people = people.people;
-        preset_sources = people.preset_sources;
+        preset_uses.extend(
+            people
+                .preset_sources
+                .into_iter()
+                .map(|source| (PresetKind::Person, source)),
+        );
     }
 
-    Ok(TranslateOutcome {
-        draft,
-        preset_sources,
-    })
+    Ok(TranslateOutcome { draft, preset_uses })
 }
 
 /// Translate one text field, or pass an empty source through unchanged.
@@ -1408,56 +1477,59 @@ struct TranslatedPeople {
     preset_sources: Vec<String>,
 }
 
-async fn translate_tags(
+/// Translate a list of values, first substituting exact preset hits. Values
+/// that hit a preset are not sent to the provider at all; only misses are
+/// batched into one request. Returns the translated values (same order) and the
+/// preset source names that were applied.
+async fn translate_values(
     translator: &dyn PromptTranslator,
-    tags: &[String],
-    templates: &Templates,
+    values: &[String],
+    presets: &HashMap<String, String>,
+    template: &str,
     settings: &ProviderSettings,
-) -> Result<Vec<String>> {
+    field: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut translated = values.to_vec();
     let mut segments = Vec::new();
-    for (index, tag) in tags.iter().enumerate() {
-        if !tag.trim().is_empty() {
+    let mut positions = Vec::new();
+    let mut preset_sources = Vec::new();
+
+    for (index, value) in values.iter().enumerate() {
+        if value.trim().is_empty() {
+            continue;
+        }
+        if let Some(target) = presets.get(&normalize_preset_key(value)) {
+            translated[index] = target.clone();
+            preset_sources.push(value.trim().to_string());
+        } else {
             segments.push(Segment {
-                id: format!("tag:{index}"),
-                text: tag.clone(),
+                id: format!("{field}:{index}"),
+                text: value.clone(),
             });
+            positions.push(index);
         }
     }
+
     if segments.is_empty() {
-        return Ok(tags.to_vec());
+        return Ok((translated, preset_sources));
     }
-    let instruction = render_template(
-        &templates.tags,
-        &tags.join("\n"),
-        &segments,
-        settings,
-        "tags",
-    );
-    let translations = call_segments(translator, &segments, instruction, settings)
-        .await
-        .context("翻译标签失败")?;
-    Ok(tags
-        .iter()
-        .enumerate()
-        .map(|(index, tag)| {
-            if tag.trim().is_empty() {
-                tag.clone()
-            } else {
-                translations
-                    .get(&format!("tag:{index}"))
-                    .cloned()
-                    .unwrap_or_else(|| tag.clone())
-            }
-        })
-        .collect())
+    let instruction = render_template(template, &values.join("\n"), &segments, settings, field);
+    let translations = call_segments(translator, &segments, instruction, settings).await?;
+    for (position, segment) in positions.iter().zip(segments.iter()) {
+        translated[*position] = translations
+            .get(&segment.id)
+            .cloned()
+            .ok_or_else(|| anyhow!("翻译服务未返回字段 {} 的结果", segment.id))?;
+    }
+    Ok((translated, preset_sources))
 }
 
 async fn translate_people(
     translator: &dyn PromptTranslator,
     people: &[PersonRecord],
+    presets: &HashMap<String, String>,
     templates: &Templates,
     settings: &ProviderSettings,
-    presets: &HashMap<String, String>,
 ) -> Result<TranslatedPeople> {
     if people.is_empty() {
         return Ok(TranslatedPeople {
@@ -1616,11 +1688,25 @@ fn normalize_preset_key(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
-fn preset_lookup(presets: &[PresetRecord]) -> HashMap<String, String> {
-    presets
-        .iter()
-        .map(|preset| (normalize_preset_key(&preset.source), preset.target.clone()))
-        .collect()
+#[derive(Debug, Default)]
+struct PresetLookup {
+    person: HashMap<String, String>,
+    tag: HashMap<String, String>,
+    genre: HashMap<String, String>,
+}
+
+fn preset_lookup(presets: &[PresetRecord]) -> PresetLookup {
+    let mut lookup = PresetLookup::default();
+    for preset in presets {
+        let key = normalize_preset_key(&preset.source);
+        let map = match parse_preset_kind(&preset.kind) {
+            PresetKind::Person => &mut lookup.person,
+            PresetKind::Tag => &mut lookup.tag,
+            PresetKind::Genre => &mut lookup.genre,
+        };
+        map.insert(key, preset.target.clone());
+    }
+    lookup
 }
 
 fn record_translations(
