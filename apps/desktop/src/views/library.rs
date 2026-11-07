@@ -652,10 +652,11 @@ impl AppState {
 
         let chip = |filter: StatusFilter, count: usize| {
             let active = self.library.filter == filter;
-            div()
+            h_flex()
                 .id(("filter", filter as usize))
                 .h(px(30.))
                 .px(px(12.))
+                .gap_1()
                 .rounded_full()
                 .border_1()
                 .border_color(if active {
@@ -679,13 +680,12 @@ impl AppState {
                     this.library.filter = filter;
                     cx.notify();
                 }))
+                .child(filter.label())
                 .child(
-                    h_flex().gap_1().child(filter.label()).child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(ui::muted(theme))
-                            .child(count.to_string()),
-                    ),
+                    div()
+                        .text_size(px(11.))
+                        .text_color(ui::muted(theme))
+                        .child(count.to_string()),
                 )
         };
 
