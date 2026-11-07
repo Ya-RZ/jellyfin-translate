@@ -870,12 +870,6 @@ impl AppService {
         let mut report = WriteReport::default();
         for id in ids {
             let one = self.write_back_fields(&id, ALL_FIELDS.to_vec()).await?;
-            if one.written > 0 {
-                // Only a successful full-field write marks the item written; the
-                // per-field writer itself always leaves it in Draft state.
-                let mut inner = self.inner()?;
-                inner.store.set_status(&id, store::STATUS_WRITTEN)?;
-            }
             report.written += one.written;
             report.failed.extend(one.failed);
         }
@@ -885,8 +879,9 @@ impl AppService {
     /// Write only the selected fields of one item back to Jellyfin.
     ///
     /// Reads the full DTO, changes only the selected fields (plus their lock
-    /// flags), posts it and verifies each written field by reading it back. The
-    /// item stays a Draft; only [`Self::write_back`] promotes it to Written.
+    /// flags), posts it and verifies each written field by reading it back. On
+    /// success the item is marked Written (the server now has the new value);
+    /// saving a draft or translating again naturally moves it back to Draft.
     pub async fn write_back_fields(
         &self,
         item_id: &str,
@@ -915,9 +910,7 @@ impl AppService {
         match self.write_item_fields(api.as_ref(), &item, &fields).await {
             Ok(locked_fields) => {
                 let mut inner = self.inner()?;
-                inner
-                    .store
-                    .mark_draft_with_locks(&item.id, &locked_fields)?;
+                inner.store.mark_written(&item.id, &locked_fields)?;
                 Ok(WriteReport {
                     written: 1,
                     failed: Vec::new(),

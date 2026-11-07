@@ -366,40 +366,39 @@ impl AppState {
             };
 
             body = body.child(
-                h_flex()
+                v_flex()
                     .w_full()
                     .min_w_0()
-                    .items_center()
-                    .gap_3()
+                    .gap(px(5.))
                     .px(px(18.))
                     .py(px(14.))
                     .border_b_1()
                     .border_color(ui::border(theme))
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(px(5.))
+                        h_flex()
+                            .gap_2()
+                            .items_center()
                             .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_size(px(13.))
-                                            .font_semibold()
-                                            .child(field.label()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.5))
-                                            .text_color(ui::muted(theme))
-                                            .child("当前值"),
-                                    ),
+                                div()
+                                    .text_size(px(13.))
+                                    .font_semibold()
+                                    .child(field.label()),
                             )
                             .child(
                                 div()
-                                    .w_full()
+                                    .text_size(px(10.5))
+                                    .text_color(ui::muted(theme))
+                                    .child("当前值"),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
                                     .min_w_0()
                                     .whitespace_normal()
                                     .line_clamp(4)
@@ -411,18 +410,16 @@ impl AppState {
                                     .text_size(px(12.5))
                                     .text_color(theme.foreground)
                                     .child(current),
+                            )
+                            .child(
+                                Button::new(format!("edit-field-open-{}", field.label()))
+                                    .small()
+                                    .label("编辑")
+                                    .disabled(busy || locked)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_field_editor(field, window, cx)
+                                    })),
                             ),
-                    )
-                    .child(
-                        h_flex().flex_shrink_0().items_center().child(
-                            Button::new(format!("edit-field-open-{}", field.label()))
-                                .small()
-                                .label("编辑")
-                                .disabled(busy || locked)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_field_editor(field, window, cx)
-                                })),
-                        ),
                     ),
             );
         }

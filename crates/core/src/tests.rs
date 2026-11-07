@@ -1179,9 +1179,9 @@ async fn write_back_fields_only_writes_selected_field_and_keeps_draft() {
     assert!(!locked.contains(&"Tags"));
     assert!(!locked.contains(&"Cast"));
 
-    // A partial write-back keeps the item in Draft and stores the new locks.
+    // A successful write-back marks the item Written but keeps the draft text.
     let item = service.items("movies").unwrap().remove(0);
-    assert_eq!(item.status, TranslationStatus::Draft);
+    assert_eq!(item.status, TranslationStatus::Written);
     assert_eq!(item.title, "盗梦空间");
     assert_eq!(item.overview, "简介");
     let record = {
@@ -1190,6 +1190,13 @@ async fn write_back_fields_only_writes_selected_field_and_keeps_draft() {
     };
     assert!(record.locked_fields.iter().any(|field| field == "Overview"));
     assert!(!record.locked_fields.iter().any(|field| field == "Name"));
+
+    // Editing/translating again naturally goes back to Draft.
+    service.save_draft("m1", title_edit("盗梦空间 2")).unwrap();
+    assert_eq!(
+        service.items("movies").unwrap()[0].status,
+        TranslationStatus::Draft
+    );
 }
 
 #[tokio::test]
@@ -1249,7 +1256,7 @@ async fn original_title_lock_falls_back_when_the_server_rejects_it() {
         .locked_fields
         .iter()
         .any(|field| field == "OriginalTitle"));
-    assert_eq!(record.status, store::STATUS_DRAFT);
+    assert_eq!(record.status, store::STATUS_WRITTEN);
 }
 
 #[tokio::test]

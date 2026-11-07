@@ -557,18 +557,6 @@ impl Store {
         Ok(())
     }
 
-    /// Record fields locked on the server after a *partial* write-back while
-    /// keeping the item in the draft state (only a full write-back marks it
-    /// written).
-    pub fn mark_draft_with_locks(&mut self, item_id: &str, locked_fields: &[String]) -> Result<()> {
-        let changed = self.conn.execute(
-            "UPDATE items SET status = ?2, locked_fields_json = ?3 WHERE id = ?1",
-            params![item_id, STATUS_DRAFT, serde_json::to_string(locked_fields)?],
-        )?;
-        anyhow::ensure!(changed > 0, "item {item_id} not found");
-        Ok(())
-    }
-
     pub fn set_locked(&mut self, ids: &[String], locked: bool) -> Result<usize> {
         let tx = self.conn.transaction()?;
         let mut changed = 0;
