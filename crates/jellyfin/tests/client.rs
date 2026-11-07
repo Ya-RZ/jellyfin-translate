@@ -499,3 +499,76 @@ async fn invalid_ids_are_rejected_before_any_request_is_sent() {
         "no request should reach the server, got {requests:?}"
     );
 }
+
+#[tokio::test]
+async fn users_lists_accounts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/Users"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "Id": "user-1", "Name": "Alice" },
+            { "Id": "user-2", "Name": "Bob" },
+        ])))
+        .mount(&server)
+        .await;
+
+    let users = client(&server).users().await.expect("users");
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0].id, "user-1");
+    assert_eq!(users[0].name, "Alice");
+    assert_eq!(users[1].id, "user-2");
+
+    let requests = received(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert_media_browser_auth(&requests[0]);
+}
+
+#[tokio::test]
+async fn item_for_user_uses_the_user_scoped_route() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/Users/user-1/Items/item-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "Id": "item-1",
+            "Name": "Inception",
+        })))
+        .mount(&server)
+        .await;
+
+    let item = client(&server)
+        .item_for_user("user-1", "item-1")
+        .await
+        .expect("user-scoped item");
+    assert_eq!(item["Id"], "item-1");
+    assert_eq!(item["Name"], "Inception");
+
+    let requests = received(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/Users/user-1/Items/item-1");
+    assert_media_browser_auth(&requests[0]);
+}
+
+#[tokio::test]
+async fn api_errors_keep_the_http_status_code() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/Users/user-1/Items/missing"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .item_for_user("user-1", "missing")
+        .await
+        .expect_err("404 must be an error");
+    let api_error = error
+        .downcast_ref::<jellyfin::ApiError>()
+        .expect("API errors retain their status");
+    assert_eq!(api_error.status, Some(404));
+    assert!(api_error.context.contains("/Users/user-1/Items/missing"));
+    assert!(api_error.body.contains("not found"));
+
+    let message = error.to_string();
+    assert!(message.contains("404"), "{message}");
+    assert!(message.contains("/Users/user-1/Items/missing"), "{message}");
+}

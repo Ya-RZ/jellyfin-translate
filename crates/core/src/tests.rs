@@ -23,6 +23,10 @@ struct FakeApi {
     /// Simulate a server that rejects DTOs containing this `LockedFields` value.
     rejected_locked_field: Mutex<Option<String>>,
     image_calls: Mutex<Vec<(String, String, u32)>>,
+    users: Mutex<Vec<jellyfin::UserDto>>,
+    item_routes: Mutex<Vec<String>>,
+    user_item_status: Mutex<Option<u16>>,
+    legacy_item_status: Mutex<Option<u16>>,
 }
 
 impl FakeApi {
@@ -42,6 +46,10 @@ impl FakeApi {
             ignored_update_fields: Mutex::new(Vec::new()),
             rejected_locked_field: Mutex::new(None),
             image_calls: Mutex::new(Vec::new()),
+            users: Mutex::new(Vec::new()),
+            item_routes: Mutex::new(Vec::new()),
+            user_item_status: Mutex::new(None),
+            legacy_item_status: Mutex::new(None),
         })
     }
 
@@ -56,6 +64,28 @@ impl FakeApi {
         *self.rejected_locked_field.lock().unwrap() = Some(field.to_string());
     }
 
+    fn set_users(&self, users: &[(&str, &str)]) {
+        *self.users.lock().unwrap() = users
+            .iter()
+            .map(|(id, name)| jellyfin::UserDto {
+                id: (*id).to_string(),
+                name: (*name).to_string(),
+            })
+            .collect();
+    }
+
+    fn set_user_item_status(&self, status: Option<u16>) {
+        *self.user_item_status.lock().unwrap() = status;
+    }
+
+    fn set_legacy_item_status(&self, status: Option<u16>) {
+        *self.legacy_item_status.lock().unwrap() = status;
+    }
+
+    fn item_routes(&self) -> Vec<String> {
+        self.item_routes.lock().unwrap().clone()
+    }
+
     fn updates(&self) -> Vec<(String, Value)> {
         self.updates.lock().unwrap().clone()
     }
@@ -63,6 +93,15 @@ impl FakeApi {
     fn image_calls(&self) -> Vec<(String, String, u32)> {
         self.image_calls.lock().unwrap().clone()
     }
+}
+
+fn fake_api_error(status: u16, context: &str) -> anyhow::Error {
+    jellyfin::ApiError {
+        status: Some(status),
+        context: context.to_string(),
+        body: "fake server error".to_string(),
+    }
+    .into()
 }
 
 fn dto_json(item: &jellyfin::ItemDto) -> Value {
@@ -98,6 +137,10 @@ impl JellyfinApi for FakeApi {
 
     fn libraries<'a>(&'a self) -> BoxFuture<'a, Result<Vec<jellyfin::Library>>> {
         Box::pin(async move { Ok(self.libraries.clone()) })
+    }
+
+    fn users<'a>(&'a self) -> BoxFuture<'a, Result<Vec<jellyfin::UserDto>>> {
+        Box::pin(async move { Ok(self.users.lock().unwrap().clone()) })
     }
 
     fn items_page<'a>(
@@ -137,6 +180,38 @@ impl JellyfinApi for FakeApi {
 
     fn item<'a>(&'a self, item_id: &'a str) -> BoxFuture<'a, Result<Value>> {
         Box::pin(async move {
+            self.item_routes
+                .lock()
+                .unwrap()
+                .push(format!("legacy:{item_id}"));
+            if let Some(status) = *self.legacy_item_status.lock().unwrap() {
+                return Err(fake_api_error(status, &format!("GET /Items/{item_id}")));
+            }
+            self.dtos
+                .lock()
+                .unwrap()
+                .get(item_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("fake api: unknown item {item_id}"))
+        })
+    }
+
+    fn item_for_user<'a>(
+        &'a self,
+        user_id: &'a str,
+        item_id: &'a str,
+    ) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            self.item_routes
+                .lock()
+                .unwrap()
+                .push(format!("user:{user_id}:{item_id}"));
+            if let Some(status) = *self.user_item_status.lock().unwrap() {
+                return Err(fake_api_error(
+                    status,
+                    &format!("GET /Users/{user_id}/Items/{item_id}"),
+                ));
+            }
             self.dtos
                 .lock()
                 .unwrap()
@@ -1331,4 +1406,146 @@ async fn translate_preview_rejects_locked_items() {
     };
     assert_eq!(record.status, store::STATUS_UNTRANSLATED);
     assert!(record.draft_name.is_none());
+}
+
+async fn connected_service(label: &str, fake: &Arc<FakeApi>) -> (AppService, std::path::PathBuf) {
+    let dir = temp_data_dir(label);
+    let service = AppService::open_at(&dir).unwrap();
+    let fake_for_factory = fake.clone();
+    service
+        .install_client_factory(Arc::new(move |_url, _key| {
+            Ok(fake_for_factory.clone() as Arc<dyn JellyfinApi>)
+        }))
+        .unwrap();
+    service
+        .connect("http://media.home:8096", "secret")
+        .await
+        .unwrap();
+    service.sync_all(|_| {}).await.unwrap();
+    (service, dir)
+}
+
+fn title_edit(title: &str) -> ItemEdit {
+    ItemEdit {
+        title: title.to_string(),
+        original_title: "Inception".into(),
+        overview: "简介".into(),
+        tags: vec!["科幻".into()],
+        people: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn item_reads_prefer_the_cached_user_route() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    fake.set_users(&[("u1", "Alice"), ("u2", "Bob")]);
+    let (service, dir) = connected_service("user-route", &fake).await;
+
+    service.save_draft("m1", title_edit("盗梦空间")).unwrap();
+    let report = service
+        .write_back_fields("m1", vec![FieldKind::Title])
+        .await
+        .unwrap();
+    assert_eq!(report.written, 1);
+    assert!(report.failed.is_empty());
+
+    let routes = fake.item_routes();
+    assert_eq!(routes.len(), 2, "one read + one read-back: {routes:?}");
+    assert!(
+        routes.iter().all(|route| route == "user:u1:m1"),
+        "expected the first cached user, got {routes:?}"
+    );
+
+    drop(service);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn item_reads_fall_back_to_the_legacy_route_on_400_or_404() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    fake.set_users(&[("u1", "Alice")]);
+    fake.set_user_item_status(Some(404));
+    let (service, dir) = connected_service("user-route-fallback", &fake).await;
+
+    service.save_draft("m1", title_edit("盗梦空间")).unwrap();
+    let report = service
+        .write_back_fields("m1", vec![FieldKind::Title])
+        .await
+        .unwrap();
+    assert_eq!(report.written, 1);
+
+    let routes = fake.item_routes();
+    assert_eq!(
+        routes,
+        vec![
+            "user:u1:m1".to_string(),
+            "legacy:m1".to_string(),
+            "user:u1:m1".to_string(),
+            "legacy:m1".to_string(),
+        ],
+        "write read and read-back verification both fall back"
+    );
+
+    drop(service);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn item_reads_use_the_legacy_route_without_users() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    // No users: connect caches no user id.
+    let (service, dir) = connected_service("user-route-none", &fake).await;
+
+    service.save_draft("m1", title_edit("盗梦空间")).unwrap();
+    let report = service
+        .write_back_fields("m1", vec![FieldKind::Title])
+        .await
+        .unwrap();
+    assert_eq!(report.written, 1);
+
+    let routes = fake.item_routes();
+    assert!(
+        routes.iter().all(|route| route == "legacy:m1"),
+        "expected legacy-only routing, got {routes:?}"
+    );
+
+    drop(service);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn item_errors_keep_the_http_status_when_both_routes_fail() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    fake.set_users(&[("u1", "Alice")]);
+    fake.set_user_item_status(Some(400));
+    fake.set_legacy_item_status(Some(500));
+    let (service, dir) = connected_service("user-route-errors", &fake).await;
+
+    let error = service.fetch_item(fake.as_ref(), "m1").await.unwrap_err();
+    let api_error = error
+        .downcast_ref::<jellyfin::ApiError>()
+        .expect("HTTP status must survive as a typed error");
+    assert_eq!(api_error.status, Some(500));
+
+    let report = service
+        .write_back_fields("m1", vec![FieldKind::Title])
+        .await
+        .unwrap();
+    assert_eq!(report.written, 0);
+    assert!(report.failed[0].1.contains("500"), "{:?}", report.failed);
+
+    drop(service);
+    std::fs::remove_dir_all(&dir).ok();
 }

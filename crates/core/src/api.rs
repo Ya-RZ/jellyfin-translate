@@ -22,6 +22,7 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub(crate) trait JellyfinApi: Send + Sync {
     fn system_info<'a>(&'a self) -> BoxFuture<'a, Result<SystemInfo>>;
     fn libraries<'a>(&'a self) -> BoxFuture<'a, Result<Vec<Library>>>;
+    fn users<'a>(&'a self) -> BoxFuture<'a, Result<Vec<jellyfin::UserDto>>>;
     fn items_page<'a>(
         &'a self,
         parent_id: Option<&'a str>,
@@ -30,6 +31,11 @@ pub(crate) trait JellyfinApi: Send + Sync {
         limit: usize,
     ) -> BoxFuture<'a, Result<ItemsPage>>;
     fn item<'a>(&'a self, item_id: &'a str) -> BoxFuture<'a, Result<Value>>;
+    fn item_for_user<'a>(
+        &'a self,
+        user_id: &'a str,
+        item_id: &'a str,
+    ) -> BoxFuture<'a, Result<Value>>;
     fn update_item<'a>(&'a self, item_id: &'a str, dto: &'a Value) -> BoxFuture<'a, Result<()>>;
     fn image<'a>(
         &'a self,
@@ -46,6 +52,10 @@ impl JellyfinApi for jellyfin::Client {
 
     fn libraries<'a>(&'a self) -> BoxFuture<'a, Result<Vec<Library>>> {
         Box::pin(jellyfin::Client::libraries(self))
+    }
+
+    fn users<'a>(&'a self) -> BoxFuture<'a, Result<Vec<jellyfin::UserDto>>> {
+        Box::pin(jellyfin::Client::users(self))
     }
 
     fn items_page<'a>(
@@ -66,6 +76,14 @@ impl JellyfinApi for jellyfin::Client {
 
     fn item<'a>(&'a self, item_id: &'a str) -> BoxFuture<'a, Result<Value>> {
         Box::pin(jellyfin::Client::item(self, item_id))
+    }
+
+    fn item_for_user<'a>(
+        &'a self,
+        user_id: &'a str,
+        item_id: &'a str,
+    ) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(jellyfin::Client::item_for_user(self, user_id, item_id))
     }
 
     fn update_item<'a>(&'a self, item_id: &'a str, dto: &'a Value) -> BoxFuture<'a, Result<()>> {

@@ -20,6 +20,30 @@ pub const ITEM_FIELDS: &str = "Overview,OriginalTitle,Tags,Genres,People,ImageTa
 /// Maximum number of response-body characters quoted in error messages.
 const ERROR_SNIPPET_CHARS: usize = 400;
 
+/// HTTP error returned by the client, retaining the status code so callers can
+/// distinguish "user-scoped route not usable" (400/404) from real failures.
+#[derive(Debug, Clone)]
+pub struct ApiError {
+    pub status: Option<u16>,
+    pub context: String,
+    pub body: String,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            Some(status) => write!(
+                formatter,
+                "{} failed: HTTP {}: {}",
+                self.context, status, self.body
+            ),
+            None => write!(formatter, "{} failed: {}", self.context, self.body),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SystemInfo {
@@ -41,6 +65,18 @@ pub struct Library {
     #[serde(default)]
     pub collection_type: Option<String>,
 }
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UserDto {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Alias used by integration callers that only need id/name.
+pub type UserSummary = UserDto;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -164,10 +200,12 @@ impl Client {
             return Ok(resp);
         }
         let body = resp.bytes().await.unwrap_or_default();
-        anyhow::bail!(
-            "{ctx} failed: HTTP {status}: {}",
-            body_snippet(body.as_ref())
-        );
+        Err(ApiError {
+            status: Some(status.as_u16()),
+            context: ctx.to_string(),
+            body: body_snippet(body.as_ref()),
+        }
+        .into())
     }
 
     pub async fn system_info(&self) -> Result<SystemInfo> {
@@ -187,6 +225,13 @@ impl Client {
         let resp = Self::ensure_ok(resp, "GET /Library/MediaFolders").await?;
         let wrapper: Wrapper = parse_json(resp, "GET /Library/MediaFolders").await?;
         Ok(wrapper.items)
+    }
+
+    /// `GET /Users` — used to pick a user context for item requests.
+    pub async fn users(&self) -> Result<Vec<UserDto>> {
+        let resp = self.get("/Users", &[]).await?;
+        let resp = Self::ensure_ok(resp, "GET /Users").await?;
+        parse_json(resp, "GET /Users").await
     }
 
     pub async fn items_page(
@@ -219,8 +264,20 @@ impl Client {
     /// Full DTO used as the base for safe read-modify-write updates.
     pub async fn item(&self, item_id: &str) -> Result<Value> {
         let item_id = path_segment("item id", item_id)?;
-        let path = format!("/Items/{item_id}");
-        let resp = self.get(&path, &[]).await?;
+        self.item_at(&format!("/Items/{item_id}")).await
+    }
+
+    /// Same as [`Self::item`] but scoped to a user. Jellyfin 12.x sometimes
+    /// rejects the user-less route when the API key has no user context.
+    pub async fn item_for_user(&self, user_id: &str, item_id: &str) -> Result<Value> {
+        let user_id = path_segment("user id", user_id)?;
+        let item_id = path_segment("item id", item_id)?;
+        self.item_at(&format!("/Users/{user_id}/Items/{item_id}"))
+            .await
+    }
+
+    async fn item_at(&self, path: &str) -> Result<Value> {
+        let resp = self.get(path, &[]).await?;
         let resp = Self::ensure_ok(resp, &format!("GET {path}")).await?;
         parse_json(resp, &format!("GET {path}")).await
     }

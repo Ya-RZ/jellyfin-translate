@@ -215,6 +215,10 @@ type ClientFactory = dyn Fn(&str, &str) -> Result<Arc<dyn JellyfinApi>> + Send +
 struct Inner {
     store: Store,
     api: Option<Arc<dyn JellyfinApi>>,
+    /// First user returned by `GET /Users`; item reads prefer
+    /// `/Users/{id}/Items/{item}` since Jellyfin 12.x rejects the user-less
+    /// route for API keys without a user context.
+    user_id: Option<String>,
     /// Some Jellyfin builds reject `OriginalTitle` in `LockedFields`; after the
     /// first rejection we stop sending it for the rest of the session.
     original_title_lock_supported: bool,
@@ -268,6 +272,7 @@ impl AppService {
             inner: Arc::new(Mutex::new(Inner {
                 store,
                 api: None,
+                user_id: None,
                 original_title_lock_supported: true,
                 #[cfg(test)]
                 translator: None,
@@ -286,6 +291,7 @@ impl AppService {
             inner: Arc::new(Mutex::new(Inner {
                 store: Store::open_in_memory()?,
                 api: None,
+                user_id: None,
                 original_title_lock_supported: true,
                 #[cfg(test)]
                 translator: None,
@@ -337,6 +343,30 @@ impl AppService {
         let api = self.make_api(url, api_key)?;
         let info = api.system_info().await?;
 
+        // Cache a user context for item reads; not being able to list users is
+        // not fatal (the legacy `/Items/{id}` route is tried as a fallback).
+        let user_id = match api.users().await {
+            Ok(users) => {
+                let user_id = users
+                    .into_iter()
+                    .map(|user| user.id)
+                    .find(|id| !id.trim().is_empty());
+                if user_id.is_none() {
+                    tracing::warn!(
+                        "Jellyfin returned no users; item fetches will use /Items/{{id}}"
+                    );
+                }
+                user_id
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "GET /Users failed; item fetches will use /Items/{{id}}"
+                );
+                None
+            }
+        };
+
         // Persist only after the server accepted these credentials. A failed
         // write must not turn a successful connection into an error.
         let config = JellyfinConfig {
@@ -350,6 +380,7 @@ impl AppService {
         {
             let mut inner = self.inner()?;
             inner.api = Some(api);
+            inner.user_id = user_id;
         }
         tracing::info!(server = %info.server_name, version = %info.version, "connected to Jellyfin");
         Ok(info)
@@ -363,6 +394,29 @@ impl AppService {
             }
         }
         Ok(Arc::new(jellyfin::Client::new(url, api_key)?))
+    }
+
+    /// Fetch the full DTO, preferring the user-scoped route. Falls back to the
+    /// legacy `/Items/{id}` route only when the scoped route answers 400/404
+    /// (Jellyfin 12.x without a user context) or when no user id is cached.
+    async fn fetch_item(&self, api: &dyn JellyfinApi, item_id: &str) -> Result<Value> {
+        // Copy the id out before awaiting: never hold the mutex across `await`.
+        let user_id = { self.inner()?.user_id.clone() };
+        if let Some(user_id) = user_id {
+            match api.item_for_user(&user_id, item_id).await {
+                Ok(value) => return Ok(value),
+                Err(error) if is_fallback_status(&error) => {
+                    tracing::debug!(
+                        item = %item_id,
+                        user = %user_id,
+                        error = %error,
+                        "user-scoped item fetch failed; falling back to /Items"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        api.item(item_id).await
     }
 
     /// Path of the persisted connection settings.
@@ -1538,6 +1592,14 @@ fn record_translations(
 // Write-back
 // ---------------------------------------------------------------------------
 
+fn is_fallback_status(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<jellyfin::ApiError>()
+        .and_then(|error| error.status)
+        .map(|status| status == 400 || status == 404)
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Default)]
 struct ExpectedWrite {
     name: Option<String>,
@@ -1576,8 +1638,8 @@ impl AppService {
         item: &ItemRecord,
         fields: &[FieldKind],
     ) -> Result<Vec<String>> {
-        let mut dto = api
-            .item(&item.id)
+        let mut dto = self
+            .fetch_item(api, &item.id)
             .await
             .with_context(|| format!("读取条目 {} 完整 DTO 失败", item.id))?;
         let mut expected = ExpectedWrite::default();
@@ -1664,7 +1726,7 @@ impl AppService {
             }
         }
 
-        verify_written(api, item, &expected).await?;
+        self.verify_written(api, item, &expected).await?;
         Ok(locked_fields)
     }
 }
@@ -1741,94 +1803,97 @@ fn merge_locked_fields(existing: Option<&Value>, desired: &[&str]) -> Vec<String
     }
     fields
 }
-async fn verify_written(
-    api: &dyn JellyfinApi,
-    item: &ItemRecord,
-    expected: &ExpectedWrite,
-) -> Result<()> {
-    let after = api
-        .item(&item.id)
-        .await
-        .with_context(|| format!("读回条目 {} 失败", item.id))?;
+impl AppService {
+    async fn verify_written(
+        &self,
+        api: &dyn JellyfinApi,
+        item: &ItemRecord,
+        expected: &ExpectedWrite,
+    ) -> Result<()> {
+        let after = self
+            .fetch_item(api, &item.id)
+            .await
+            .with_context(|| format!("读回条目 {} 失败", item.id))?;
 
-    if let Some(expected_name) = &expected.name {
-        let actual_name = after.get("Name").and_then(Value::as_str).unwrap_or("");
-        anyhow::ensure!(
-            actual_name == expected_name,
-            "读回校验失败：Name 期望 {expected_name:?}，实际 {actual_name:?}"
-        );
+        if let Some(expected_name) = &expected.name {
+            let actual_name = after.get("Name").and_then(Value::as_str).unwrap_or("");
+            anyhow::ensure!(
+                actual_name == expected_name,
+                "读回校验失败：Name 期望 {expected_name:?}，实际 {actual_name:?}"
+            );
+        }
+
+        if let Some(expected) = &expected.original_title {
+            let actual = after
+                .get("OriginalTitle")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            anyhow::ensure!(
+                actual == expected,
+                "读回校验失败：OriginalTitle 期望 {expected:?}，实际 {actual:?}"
+            );
+        }
+
+        if let Some(expected) = &expected.overview {
+            let actual = after.get("Overview").and_then(Value::as_str).unwrap_or("");
+            anyhow::ensure!(
+                actual == expected,
+                "读回校验失败：Overview 期望 {expected:?}，实际 {actual:?}"
+            );
+        }
+
+        if let Some(expected_tags) = &expected.tags {
+            let actual_tags = after
+                .get("Tags")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            anyhow::ensure!(
+                actual_tags == *expected_tags,
+                "读回校验失败：Tags 期望 {expected_tags:?}，实际 {actual_tags:?}"
+            );
+        }
+
+        if let Some(expected_people) = &expected.people {
+            let actual_people = after
+                .get("People")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| {
+                            (
+                                value
+                                    .get("Name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                value
+                                    .get("Role")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let expected = expected_people
+                .iter()
+                .map(|person| (person.name.clone(), person.role.clone()))
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                actual_people == expected,
+                "读回校验失败：People 期望 {expected:?}，实际 {actual_people:?}"
+            );
+        }
+
+        Ok(())
     }
-
-    if let Some(expected) = &expected.original_title {
-        let actual = after
-            .get("OriginalTitle")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        anyhow::ensure!(
-            actual == expected,
-            "读回校验失败：OriginalTitle 期望 {expected:?}，实际 {actual:?}"
-        );
-    }
-
-    if let Some(expected) = &expected.overview {
-        let actual = after.get("Overview").and_then(Value::as_str).unwrap_or("");
-        anyhow::ensure!(
-            actual == expected,
-            "读回校验失败：Overview 期望 {expected:?}，实际 {actual:?}"
-        );
-    }
-
-    if let Some(expected_tags) = &expected.tags {
-        let actual_tags = after
-            .get("Tags")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|value| value.as_str().map(str::to_string))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        anyhow::ensure!(
-            actual_tags == *expected_tags,
-            "读回校验失败：Tags 期望 {expected_tags:?}，实际 {actual_tags:?}"
-        );
-    }
-
-    if let Some(expected_people) = &expected.people {
-        let actual_people = after
-            .get("People")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .map(|value| {
-                        (
-                            value
-                                .get("Name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                            value
-                                .get("Role")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let expected = expected_people
-            .iter()
-            .map(|person| (person.name.clone(), person.role.clone()))
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            actual_people == expected,
-            "读回校验失败：People 期望 {expected:?}，实际 {actual_people:?}"
-        );
-    }
-
-    Ok(())
 }
 
 /// Create `path` with private permissions (0600 on Unix) and flush it.
