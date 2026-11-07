@@ -1357,6 +1357,10 @@ impl Render for AppState {
             root = root.child(self.render_field_editor(&theme, cx));
         }
 
+        if self.presets.import_open {
+            root = root.child(self.render_preset_import(&theme, cx));
+        }
+
         if self.sync_picker.open {
             root = root.child(self.render_sync_picker(&theme, cx));
         }
