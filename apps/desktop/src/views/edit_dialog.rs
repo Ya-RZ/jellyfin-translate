@@ -143,6 +143,32 @@ impl FieldEditorState {
     }
 }
 
+fn effective_text(item: &ItemView, field: EditField) -> String {
+    match field {
+        EditField::Title => item.title.clone(),
+        EditField::OriginalTitle => item.original_title.clone(),
+        EditField::Overview => item.overview.clone(),
+        EditField::Tags => {
+            if item.tags.is_empty() {
+                "—".to_string()
+            } else {
+                item.tags.join(", ")
+            }
+        }
+        EditField::People => {
+            if item.people.is_empty() {
+                "—".to_string()
+            } else {
+                item.people
+                    .iter()
+                    .map(|person| person.name.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+    }
+}
+
 fn translate_error(message: &str) -> String {
     if message.contains("API key must not be empty") {
         "未配置翻译服务的 API Key，请到「设置 → 翻译服务」填写。".to_string()
@@ -272,7 +298,7 @@ impl AppState {
                             .whitespace_normal()
                             .text_size(px(11.5))
                             .text_color(ui::muted(theme))
-                            .child("左侧为服务器原文；逐字段编辑译文，写回前会自动保存草稿。"),
+                            .child("列表显示当前值（有草稿用草稿，否则原文）；点「编辑」查看原文并修改译文。"),
                     ),
             );
 
@@ -332,40 +358,48 @@ impl AppState {
         }
 
         for field in EditField::ALL {
-            let source = self.library.edit_source.text(field);
-            let source = if source.is_empty() {
+            let current = effective_text(&item, field);
+            let current = if current.is_empty() {
                 "—".to_string()
             } else {
-                source
+                current
             };
 
             body = body.child(
-                v_flex()
+                h_flex()
                     .w_full()
                     .min_w_0()
-                    .gap(px(5.))
+                    .items_center()
+                    .gap_3()
                     .px(px(18.))
                     .py(px(14.))
                     .border_b_1()
                     .border_color(ui::border(theme))
                     .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_semibold()
-                            .child(field.label()),
-                    )
-                    .child(
-                        // Keep the button in the same row as the source box:
-                        // `h_flex` centers on the cross axis, so the button is
-                        // truly centered against the box regardless of how many
-                        // lines the preview takes.
-                        h_flex()
-                            .w_full()
+                        v_flex()
+                            .flex_1()
                             .min_w_0()
-                            .gap_3()
+                            .gap(px(5.))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .font_semibold()
+                                            .child(field.label()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(ui::muted(theme))
+                                            .child("当前值"),
+                                    ),
+                            )
                             .child(
                                 div()
-                                    .flex_1()
+                                    .w_full()
                                     .min_w_0()
                                     .whitespace_normal()
                                     .line_clamp(4)
@@ -376,17 +410,19 @@ impl AppState {
                                     .bg(theme.muted)
                                     .text_size(px(12.5))
                                     .text_color(theme.foreground)
-                                    .child(source),
-                            )
-                            .child(
-                                Button::new(format!("edit-field-open-{}", field.label()))
-                                    .small()
-                                    .label("编辑")
-                                    .disabled(busy || locked)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_field_editor(field, window, cx)
-                                    })),
+                                    .child(current),
                             ),
+                    )
+                    .child(
+                        h_flex().flex_shrink_0().items_center().child(
+                            Button::new(format!("edit-field-open-{}", field.label()))
+                                .small()
+                                .label("编辑")
+                                .disabled(busy || locked)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_field_editor(field, window, cx)
+                                })),
+                        ),
                     ),
             );
         }
@@ -1303,6 +1339,40 @@ impl AppState {
         );
     }
 
+    fn field_matches_source(&self, field: EditField, item: &ItemView) -> bool {
+        match field {
+            EditField::Title => item.title.trim() == item.source.title.trim(),
+            EditField::OriginalTitle => {
+                item.original_title.trim() == item.source.original_title.trim()
+            }
+            EditField::Overview => item.overview.trim() == item.source.overview.trim(),
+            EditField::Tags => {
+                let source = item
+                    .source
+                    .tags
+                    .iter()
+                    .map(|tag| tag.trim())
+                    .collect::<Vec<_>>();
+                let effective = item.tags.iter().map(|tag| tag.trim()).collect::<Vec<_>>();
+                !effective.is_empty() && effective == source
+            }
+            EditField::People => {
+                let source = item
+                    .source
+                    .people
+                    .iter()
+                    .map(|person| person.name.trim())
+                    .collect::<Vec<_>>();
+                let effective = item
+                    .people
+                    .iter()
+                    .map(|person| person.name.trim())
+                    .collect::<Vec<_>>();
+                !effective.is_empty() && effective == source
+            }
+        }
+    }
+
     fn write_field_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.library.field_busy || !self.edit_service_ready(cx) {
             return;
@@ -1344,6 +1414,10 @@ impl AppState {
                 this.library.field_busy = false;
                 match result {
                     Ok((report, item)) => {
+                        let matches_source = item
+                            .as_ref()
+                            .map(|item| this.field_matches_source(field, item))
+                            .unwrap_or(false);
                         if let Some(item) = item {
                             this.apply_item_snapshot(item, &[field], window, cx);
                         }
@@ -1355,6 +1429,8 @@ impl AppState {
                             let message = "写回未成功：条目可能已锁定".to_string();
                             this.library.field_error = Some(message.clone().into());
                             this.notify_toast(message, cx);
+                        } else if matches_source {
+                            this.notify_toast("写回成功，但本地当前值与原文相同，请检查", cx);
                         } else {
                             this.notify_toast("已写回", cx);
                         }
