@@ -23,7 +23,7 @@ use gpui_kit::*;
 
 use crate::covers;
 use crate::ui;
-use crate::views::{connect, library, presets, settings, sync_picker, tasks};
+use crate::views::{connect, library, metatube, presets, settings, sync_picker, tasks};
 
 /// Pages reachable from the sidebar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +105,7 @@ pub(crate) struct AppState {
     pub(crate) covers: covers::CoverCache,
     pub(crate) cover_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) sync_picker: sync_picker::SyncPickerState,
+    pub(crate) metatube: metatube::MetatubeState,
 }
 
 impl AppState {
@@ -138,6 +139,7 @@ impl AppState {
             covers: covers::CoverCache::new(),
             cover_permits: Arc::new(tokio::sync::Semaphore::new(6)),
             sync_picker: sync_picker::SyncPickerState::default(),
+            metatube: metatube::MetatubeState::new(window, cx),
         }
     }
 
@@ -1105,6 +1107,7 @@ impl AppState {
 
         let id_edit = item_id.clone();
         let id_lock = item_id.clone();
+        let id_scrape = item_id.clone();
         let lock_label = if locked { "解锁" } else { "锁定" };
 
         let footer = h_flex()
@@ -1113,6 +1116,14 @@ impl AppState {
             .flex_wrap()
             .justify_end()
             .gap(px(8.))
+            .child(
+                Button::new("drawer-scrape")
+                    .label("抓取元数据")
+                    .disabled(locked)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_metatube_picker(id_scrape.clone(), window, cx)
+                    })),
+            )
             .child(
                 Button::new("drawer-edit")
                     .label("详情")
@@ -1347,6 +1358,10 @@ impl Render for AppState {
             if let Some(item) = self.selected_item() {
                 root = root.child(self.render_drawer(&item, window, &theme, cx));
             }
+        }
+
+        if self.metatube.open {
+            root = root.child(self.render_metatube_picker(&theme, cx));
         }
 
         if self.library.editing_item().is_some() {

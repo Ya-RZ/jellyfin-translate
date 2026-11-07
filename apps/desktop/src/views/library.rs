@@ -310,6 +310,16 @@ impl AppState {
 
     // --------------------------------------------------------------- editing
 
+    /// Replace one cached item after a background change (draft save, scrape)
+    /// so the grid and the details drawer pick up the new values.
+    pub(crate) fn cache_item(&mut self, item: ItemView) {
+        if let Some(items) = self.library.items.get_mut(&item.library_id) {
+            if let Some(slot) = items.iter_mut().find(|cached| cached.id == item.id) {
+                *slot = item;
+            }
+        }
+    }
+
     pub(crate) fn open_edit(
         &mut self,
         item_id: String,

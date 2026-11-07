@@ -23,9 +23,11 @@ use store::{
 };
 
 mod api;
+mod metatube;
 use api::{JellyfinApi, PromptTranslator};
 
 pub use jellyfin::SystemInfo as ServerInfo;
+pub use metatube::{MetatubeSettings, MovieInfo, MovieSearchResult};
 
 /// Page size used when walking a Jellyfin library.
 const PAGE_SIZE: usize = 200;
@@ -33,6 +35,7 @@ const INCLUDE_ITEM_TYPES: &[&str] = &["Movie", "Series", "Season", "Episode"];
 
 const SETTING_TEMPLATES: &str = "templates";
 const SETTING_PROVIDER: &str = "provider";
+const SETTING_METATUBE: &str = "metatube";
 
 /// Per-item translation state shown in the library grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1066,6 +1069,79 @@ impl AppService {
             &serde_json::to_string(settings).context("序列化 provider settings")?,
         )?;
         Ok(())
+    }
+
+    /// MetaTube endpoint used by the "抓取元数据" action. Defaults to the
+    /// local bridge so the settings form is usable before the first save.
+    pub fn metatube_settings(&self) -> Result<MetatubeSettings> {
+        let raw = {
+            let inner = self.inner()?;
+            inner.store.get_setting(SETTING_METATUBE)?
+        };
+        match raw {
+            Some(raw) => {
+                serde_json::from_str(&raw).context("settings 表中的 metatube JSON 无法解析")
+            }
+            None => Ok(MetatubeSettings::default()),
+        }
+    }
+
+    pub fn save_metatube_settings(&self, settings: &MetatubeSettings) -> Result<()> {
+        let mut inner = self.inner()?;
+        inner.store.set_setting(
+            SETTING_METATUBE,
+            &serde_json::to_string(settings).context("序列化 metatube settings")?,
+        )?;
+        Ok(())
+    }
+
+    /// Search MetaTube candidates. `provider = Some` narrows the fan-out;
+    /// `None`/empty searches every enabled provider (slow).
+    pub async fn metatube_search(
+        &self,
+        q: String,
+        provider: Option<String>,
+    ) -> Result<Vec<MovieSearchResult>> {
+        let client = self.metatube_client()?;
+        client.search(&q, provider.as_deref(), true).await
+    }
+
+    pub async fn metatube_detail(
+        &self,
+        provider: String,
+        id: String,
+        lazy: bool,
+    ) -> Result<MovieInfo> {
+        let client = self.metatube_client()?;
+        client.detail(&provider, &id, lazy).await
+    }
+
+    fn metatube_client(&self) -> Result<metatube::MetatubeClient> {
+        metatube::MetatubeClient::new(&self.metatube_settings()?)
+    }
+
+    /// Fold a scraped [`MovieInfo`] into the item's draft and persist it.
+    ///
+    /// Mirrors the edit dialog's save path: the item must not be locked, and
+    /// only the scraped fields are replaced.
+    pub fn apply_metatube_metadata(&self, item_id: &str, info: &MovieInfo) -> Result<ItemView> {
+        let item = {
+            let inner = self.inner()?;
+            let record = inner
+                .store
+                .get_item(item_id)?
+                .ok_or_else(|| anyhow!("本地库中不存在条目 {item_id}"))?;
+            item_view(record)
+        };
+        anyhow::ensure!(!item.locked, "条目已锁定，请先解锁");
+        self.save_draft(item_id, metatube::merge_draft(&item, info))?;
+
+        let inner = self.inner()?;
+        let record = inner
+            .store
+            .get_item(item_id)?
+            .ok_or_else(|| anyhow!("本地库中不存在条目 {item_id}"))?;
+        Ok(item_view(record))
     }
 
     fn translator(&self, settings: &ProviderSettings) -> Result<Arc<dyn PromptTranslator>> {

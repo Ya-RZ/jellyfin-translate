@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 jellyfin = { path = "../jellyfin" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 store = { path = "../store" }

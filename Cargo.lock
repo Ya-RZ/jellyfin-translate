@@ -1080,6 +1080,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "jellyfin",
+ "reqwest",
  "serde",
  "serde_json",
  "store",

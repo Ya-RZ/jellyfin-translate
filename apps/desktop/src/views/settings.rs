@@ -1,6 +1,6 @@
-//! 设置页：OpenAI 兼容配置、四个字段模板、语言、数据目录与并发。
+//! 设置页：OpenAI 兼容配置、MetaTube 抓取服务、四个字段模板、语言、数据目录与并发。
 
-use ::core::{ProviderSettings, Templates};
+use ::core::{MetatubeSettings, ProviderSettings, Templates};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::{h_flex, v_flex, Sizable as _, StyledExt as _, Theme};
@@ -85,12 +85,15 @@ pub(crate) struct SettingsState {
     pub(crate) source_lang: Entity<InputState>,
     pub(crate) target_lang: Entity<InputState>,
     pub(crate) concurrency: Entity<InputState>,
+    pub(crate) metatube_base_url: Entity<InputState>,
+    pub(crate) metatube_token: Entity<InputState>,
     pub(crate) template_editor: Entity<TextareaState>,
     pub(crate) templates: Templates,
     pub(crate) template_tab: TemplateTab,
     pub(crate) loaded: bool,
     pub(crate) loading: bool,
     pub(crate) saving: bool,
+    pub(crate) metatube_saving: bool,
     pub(crate) error: Option<SharedString>,
 }
 
@@ -104,12 +107,22 @@ impl SettingsState {
             source_lang: cx.new(|cx| InputState::new(window, cx).placeholder("auto")),
             target_lang: cx.new(|cx| InputState::new(window, cx).placeholder("zh-CN")),
             concurrency: cx.new(|cx| InputState::new(window, cx).placeholder("4")),
+            metatube_base_url: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(::core::MetatubeSettings::default().base_url)
+            }),
+            metatube_token: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder("留空=未鉴权")
+            }),
             template_editor: cx.new(|cx| TextareaState::new(window, cx)),
             templates: Templates::default(),
             template_tab: TemplateTab::Title,
             loaded: false,
             loading: false,
             saving: false,
+            metatube_saving: false,
             error: None,
         }
     }
@@ -118,6 +131,7 @@ impl SettingsState {
         &mut self,
         settings: ProviderSettings,
         mut templates: Templates,
+        metatube: MetatubeSettings,
         window: &mut Window,
         cx: &mut Context<AppState>,
     ) {
@@ -141,6 +155,12 @@ impl SettingsState {
         });
         self.concurrency.update(cx, |state, cx| {
             state.set_value(settings.concurrency.to_string(), window, cx)
+        });
+        self.metatube_base_url.update(cx, |state, cx| {
+            state.set_value(metatube.base_url.clone(), window, cx)
+        });
+        self.metatube_token.update(cx, |state, cx| {
+            state.set_value(metatube.token.clone(), window, cx)
         });
 
         self.loaded = true;
@@ -218,13 +238,15 @@ impl AppState {
             |service| {
                 let settings = service.provider_settings().map_err(ui::error_text)?;
                 let templates = service.templates().map_err(ui::error_text)?;
-                Ok((settings, templates))
+                let metatube = service.metatube_settings().map_err(ui::error_text)?;
+                Ok((settings, templates, metatube))
             },
             |this, result, window, cx| {
                 this.settings.loading = false;
                 match result {
-                    Ok((settings, templates)) => {
-                        this.settings.apply(settings, templates, window, cx);
+                    Ok((settings, templates, metatube)) => {
+                        this.settings
+                            .apply(settings, templates, metatube, window, cx);
                         this.settings.error = None;
                     }
                     Err(message) => this.settings.error = Some(message.into()),
@@ -300,6 +322,46 @@ impl AppState {
                 this.settings.saving = false;
                 match result {
                     Ok(()) => this.notify_toast("设置已保存", cx),
+                    Err(message) => this.notify_toast(message, cx),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn save_metatube_settings(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let settings = MetatubeSettings {
+            base_url: self
+                .settings
+                .metatube_base_url
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+            token: self
+                .settings
+                .metatube_token
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+        };
+
+        self.settings.metatube_saving = true;
+        cx.notify();
+
+        self.spawn_job_in(
+            window,
+            cx,
+            move |service| {
+                service
+                    .save_metatube_settings(&settings)
+                    .map_err(ui::error_text)
+            },
+            |this, result, _window, cx| {
+                this.settings.metatube_saving = false;
+                match result {
+                    Ok(()) => this.notify_toast("MetaTube 设置已保存", cx),
                     Err(message) => this.notify_toast(message, cx),
                 }
                 cx.notify();
@@ -400,6 +462,57 @@ impl AppState {
                             .text_size(px(11.5))
                             .text_color(ui::muted(theme))
                             .child("超时 120s · 失败重试 1 次"),
+                    ),
+            );
+
+        let metatube_block = v_flex()
+            .w_full()
+            .gap(px(12.))
+            .p(px(18.))
+            .border_b_1()
+            .border_color(ui::border(theme))
+            .child(
+                div()
+                    .text_size(px(13.5))
+                    .font_semibold()
+                    .child("视频元数据抓取（MetaTube）"),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(ui::muted(theme))
+                    .child("详情抽屉里的「抓取元数据」使用这个服务；结果只填入本地草稿，不会自动写回 Jellyfin。"),
+            )
+            .child(pair(
+                v_flex()
+                    .gap(px(6.))
+                    .child(ui::field_label("服务地址", theme))
+                    .child(Input::new(&self.settings.metatube_base_url).w_full())
+                    .into_any_element(),
+                v_flex()
+                    .gap(px(6.))
+                    .child(ui::field_label("Token（可为空）", theme))
+                    .child(Input::new(&self.settings.metatube_token).w_full())
+                    .into_any_element(),
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("save-metatube")
+                            .primary()
+                            .label("保存 MetaTube 设置")
+                            .loading(self.settings.metatube_saving)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_metatube_settings(window, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(ui::muted(theme))
+                            .child("服务未设置 -token 时 Token 留空即可。"),
                     ),
             );
 
@@ -668,6 +781,7 @@ impl AppState {
                 ui::card(theme)
                     .max_w(px(860.))
                     .child(provider_block)
+                    .child(metatube_block)
                     .child(templates_block)
                     .child(language_block)
                     .child(data_block)
