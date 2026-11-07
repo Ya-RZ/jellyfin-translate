@@ -356,28 +356,32 @@ impl AppState {
             };
 
             body = body.child(
-                h_flex()
+                v_flex()
                     .w_full()
                     .min_w_0()
-                    .gap_3()
+                    .gap(px(5.))
                     .px(px(18.))
                     .py(px(14.))
                     .border_b_1()
                     .border_color(ui::border(theme))
                     .child(
-                        v_flex()
-                            .flex_1()
+                        div()
+                            .text_size(px(13.))
+                            .font_semibold()
+                            .child(field.label()),
+                    )
+                    .child(
+                        // Keep the button in the same row as the source box:
+                        // `h_flex` centers on the cross axis, so the button is
+                        // truly centered against the box regardless of how many
+                        // lines the preview takes.
+                        h_flex()
+                            .w_full()
                             .min_w_0()
-                            .gap(px(5.))
+                            .gap_3()
                             .child(
                                 div()
-                                    .text_size(px(13.))
-                                    .font_semibold()
-                                    .child(field.label()),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
+                                    .flex_1()
                                     .min_w_0()
                                     .whitespace_normal()
                                     .line_clamp(4)
@@ -389,21 +393,16 @@ impl AppState {
                                     .text_size(px(12.5))
                                     .text_color(theme.foreground)
                                     .child(source),
+                            )
+                            .child(
+                                Button::new(format!("edit-field-open-{}", field.label()))
+                                    .small()
+                                    .label("编辑")
+                                    .disabled(busy || locked)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_field_editor(field, window, cx)
+                                    })),
                             ),
-                    )
-                    .child(
-                        // Stretch this cell to the full row height and center the
-                        // button inside it; `items_center` on the row proved to
-                        // align the button with the source box instead.
-                        v_flex().flex_shrink_0().justify_center().child(
-                            Button::new(format!("edit-field-open-{}", field.label()))
-                                .small()
-                                .label("编辑")
-                                .disabled(busy || locked)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_field_editor(field, window, cx)
-                                })),
-                        ),
                     ),
             );
         }
