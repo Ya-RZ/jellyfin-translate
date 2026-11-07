@@ -3,7 +3,7 @@
 //! 主弹窗只展示服务器原文和每个字段的 [编辑]/[写回]；[编辑] 打开嵌套小弹窗，
 //! 在原文旁边编辑译文并单独翻译/保存。标签与演职员按元素逐行编辑。
 
-use ::core::{FieldKind, ItemEdit, ItemView, PersonView};
+use ::core::{FieldKind, FieldPreview, ItemEdit, ItemView, PersonView};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{h_flex, v_flex, Disableable as _, Sizable as _, StyledExt as _, Theme};
@@ -143,19 +143,6 @@ impl FieldEditorState {
     }
 }
 
-fn format_people(people: &[PersonView]) -> String {
-    if people.is_empty() {
-        return "—".to_string();
-    }
-    // Roles stay in the data and are preserved on save, but the edit UI only
-    // lists person names now.
-    people
-        .iter()
-        .map(|person| person.name.clone())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn translate_error(message: &str) -> String {
     if message.contains("API key must not be empty") {
         "未配置翻译服务的 API Key，请到「设置 → 翻译服务」填写。".to_string()
@@ -186,18 +173,27 @@ fn new_textarea(
     entity
 }
 
-fn build_tag_rows(item: &ItemView, window: &mut Window, cx: &mut Context<AppState>) -> Vec<TagRow> {
-    let count = item.source.tags.len().max(item.tags.len());
+fn build_tag_rows_from(
+    source_tags: &[String],
+    translated_tags: &[String],
+    window: &mut Window,
+    cx: &mut Context<AppState>,
+) -> Vec<TagRow> {
+    let count = source_tags.len().max(translated_tags.len());
     (0..count)
         .map(|index| {
-            let source = item.source.tags.get(index).cloned().unwrap_or_default();
-            let value = item.tags.get(index).cloned().unwrap_or_default();
+            let source = source_tags.get(index).cloned().unwrap_or_default();
+            let value = translated_tags.get(index).cloned().unwrap_or_default();
             TagRow {
                 source,
                 value: new_textarea(&value, window, cx),
             }
         })
         .collect()
+}
+
+fn build_tag_rows(item: &ItemView, window: &mut Window, cx: &mut Context<AppState>) -> Vec<TagRow> {
+    build_tag_rows_from(&item.source.tags, &item.tags, window, cx)
 }
 
 fn build_people_rows(
@@ -224,18 +220,6 @@ fn build_people_rows(
                     .and_then(|person| person.role.clone())
                     .or_else(|| source.and_then(|person| person.role.clone())),
             }
-        })
-        .collect()
-}
-
-fn people_key(people: &[PersonView]) -> Vec<(String, String)> {
-    people
-        .iter()
-        .map(|person| {
-            (
-                person.name.trim().to_string(),
-                person.role.as_deref().unwrap_or("").trim().to_string(),
-            )
         })
         .collect()
 }
@@ -483,7 +467,7 @@ impl AppState {
             .inset_0()
             .occlude()
             .bg(hsla(0.0, 0.0, 0.0, 0.55))
-            .on_click(cx.listener(|this, _, _, cx| this.close_field_editor(cx)));
+            .on_click(cx.listener(|this, _, window, cx| this.close_field_editor(window, cx)));
 
         let header = h_flex()
             .w_full()
@@ -519,7 +503,9 @@ impl AppState {
                     .compact()
                     .label("✕")
                     .disabled(busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.close_field_editor(cx))),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.close_field_editor(window, cx)),
+                    ),
             );
 
         let mut body = v_flex().w_full().min_w_0().gap(px(12.)).p(px(18.));
@@ -747,7 +733,9 @@ impl AppState {
                     .ghost()
                     .label("关闭")
                     .disabled(busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.close_field_editor(cx))),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.close_field_editor(window, cx)),
+                    ),
             );
 
         let card = v_flex()
@@ -833,9 +821,40 @@ impl AppState {
         cx.notify();
     }
 
-    pub(crate) fn close_field_editor(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_field_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.library.field_busy {
             return;
+        }
+        if let (Some(field), Some(item)) = (
+            self.library
+                .field_editor
+                .as_ref()
+                .map(FieldEditorState::field),
+            self.library.editing_item(),
+        ) {
+            // Closing discards this editor's unsaved text: restore the current
+            // stored item value. Tags/people rows are simply dropped.
+            match field {
+                EditField::Title => {
+                    let value = item.title.clone();
+                    self.library
+                        .edit_title
+                        .update(cx, |state, cx| state.set_value(value, window, cx));
+                }
+                EditField::OriginalTitle => {
+                    let value = item.original_title.clone();
+                    self.library
+                        .edit_orig
+                        .update(cx, |state, cx| state.set_value(value, window, cx));
+                }
+                EditField::Overview => {
+                    let value = item.overview.clone();
+                    self.library
+                        .edit_overview
+                        .update(cx, |state, cx| state.set_value(value, window, cx));
+                }
+                EditField::Tags | EditField::People => {}
+            }
         }
         self.library.field_editor = None;
         self.library.field_error = None;
@@ -964,71 +983,156 @@ impl AppState {
         }
     }
 
-    fn field_unchanged(&self, field: EditField, item: &ItemView) -> bool {
+    fn preview_text(&self, field: EditField, field_preview: &FieldPreview) -> String {
         match field {
-            EditField::Title => item.title.trim() == item.source.title.trim(),
-            EditField::OriginalTitle => {
-                item.original_title.trim() == item.source.original_title.trim()
-            }
-            EditField::Overview => item.overview.trim() == item.source.overview.trim(),
+            EditField::Title => field_preview.title.clone().unwrap_or_default(),
+            EditField::OriginalTitle => field_preview.original_title.clone().unwrap_or_default(),
+            EditField::Overview => field_preview.overview.clone().unwrap_or_default(),
+            EditField::Tags => field_preview
+                .tags
+                .as_ref()
+                .map(|tags| tags.join(", "))
+                .unwrap_or_default(),
+            EditField::People => field_preview
+                .people
+                .as_ref()
+                .map(|people| {
+                    people
+                        .iter()
+                        .map(|person| person.name.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Compare the preview value with the server source (never with the store,
+    /// which is intentionally untouched by preview translation).
+    fn preview_unchanged(&self, field: EditField, field_preview: &FieldPreview) -> bool {
+        match field {
+            EditField::Title => field_preview
+                .title
+                .as_deref()
+                .map(|value| value.trim() == self.library.edit_source.title.trim())
+                .unwrap_or(false),
+            EditField::OriginalTitle => field_preview
+                .original_title
+                .as_deref()
+                .map(|value| value.trim() == self.library.edit_source.original_title.trim())
+                .unwrap_or(false),
+            EditField::Overview => field_preview
+                .overview
+                .as_deref()
+                .map(|value| value.trim() == self.library.edit_source.overview.trim())
+                .unwrap_or(false),
             EditField::Tags => {
-                let source = item
-                    .source
+                let Some(tags) = field_preview.tags.as_ref() else {
+                    return false;
+                };
+                let source = self
+                    .library
+                    .edit_source
                     .tags
                     .iter()
-                    .map(|tag| tag.trim().to_string())
+                    .map(|tag| tag.trim())
                     .collect::<Vec<_>>();
-                let translated = item
-                    .tags
-                    .iter()
-                    .map(|tag| tag.trim().to_string())
-                    .collect::<Vec<_>>();
+                let translated = tags.iter().map(|tag| tag.trim()).collect::<Vec<_>>();
                 !translated.is_empty() && translated == source
             }
             EditField::People => {
-                let source = people_key(&item.source.people);
-                let translated = people_key(&item.people);
+                let Some(people) = field_preview.people.as_ref() else {
+                    return false;
+                };
+                let source = self
+                    .library
+                    .edit_source
+                    .people
+                    .iter()
+                    .map(|person| person.name.trim())
+                    .collect::<Vec<_>>();
+                let translated = people
+                    .iter()
+                    .map(|person| person.name.trim())
+                    .collect::<Vec<_>>();
                 !translated.is_empty() && translated == source
             }
         }
     }
 
-    fn field_source_preview(&self, field: EditField, item: &ItemView) -> String {
-        match field {
-            EditField::Title => item.source.title.clone(),
-            EditField::OriginalTitle => item.source.original_title.clone(),
-            EditField::Overview => item.source.overview.clone(),
-            EditField::Tags => item.source.tags.join(", "),
-            EditField::People => format_people(&item.source.people),
-        }
-    }
-
-    fn field_effective_preview(&self, field: EditField, item: &ItemView) -> String {
-        match field {
-            EditField::Title => item.title.clone(),
-            EditField::OriginalTitle => item.original_title.clone(),
-            EditField::Overview => item.overview.clone(),
-            EditField::Tags => item.tags.join(", "),
-            EditField::People => format_people(&item.people),
-        }
-    }
-
-    fn log_translation_refresh(&self, field: EditField, item: &ItemView, unchanged: bool) {
-        let source = preview(&self.field_source_preview(field, item));
-        let translated = preview(&self.field_effective_preview(field, item));
+    fn log_preview(&self, field: EditField, field_preview: &FieldPreview, unchanged: bool) {
+        let source_text = preview(&self.library.edit_source.text(field));
+        let translated_text = preview(&self.preview_text(field, field_preview));
         tracing::debug!(
-            item = %item.id,
             field = field.label(),
             unchanged,
-            source = %source,
-            translated = %translated,
-            "edit_field_translation_refreshed"
+            source = %source_text,
+            translated = %translated_text,
+            "edit_field_preview_translated"
         );
         #[cfg(debug_assertions)]
         eprintln!(
-            "[edit-field] field={} unchanged={unchanged} source={source:?} translated={translated:?}",
+            "[edit-field-preview] field={} unchanged={unchanged} source={source_text:?} translated={translated_text:?}",
             field.label()
         );
+    }
+
+    /// Fill the preview result into the editor inputs only. Nothing is written
+    /// to the store here.
+    fn apply_preview(
+        &mut self,
+        field: EditField,
+        field_preview: &FieldPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let missing = || "翻译未返回该字段结果，请检查模型/提示词".to_string();
+        match field {
+            EditField::Title => {
+                let value = field_preview.title.clone().ok_or_else(missing)?;
+                self.library
+                    .edit_title
+                    .update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+            EditField::OriginalTitle => {
+                let value = field_preview.original_title.clone().ok_or_else(missing)?;
+                self.library
+                    .edit_orig
+                    .update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+            EditField::Overview => {
+                let value = field_preview.overview.clone().ok_or_else(missing)?;
+                self.library
+                    .edit_overview
+                    .update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+            EditField::Tags => {
+                let tags = field_preview.tags.clone().ok_or_else(missing)?;
+                let source = self.library.edit_source.tags.clone();
+                let rows = build_tag_rows_from(&source, &tags, window, cx);
+                if let Some(FieldEditorState::Tags { rows: slot }) =
+                    self.library.field_editor.as_mut()
+                {
+                    *slot = rows;
+                }
+            }
+            EditField::People => {
+                let people = field_preview.people.clone().ok_or_else(missing)?;
+                if let Some(FieldEditorState::People { rows }) = self.library.field_editor.as_mut()
+                {
+                    for (index, row) in rows.iter_mut().enumerate() {
+                        if let Some(person) = people.get(index) {
+                            let value = person.name.clone();
+                            row.name
+                                .update(cx, |state, cx| state.set_value(value, window, cx));
+                        }
+                    }
+                }
+                // row.role and row.id stay untouched: the dialog hides roles
+                // and must not clear the server-side value.
+            }
+        }
+        Ok(())
     }
 
     /// Copy the nested editor rows back into the canonical draft values.
@@ -1148,7 +1252,6 @@ impl AppState {
             return;
         }
         let item_id = item.id.clone();
-        let library_id = item.library_id.clone();
         let kind = field.kind();
 
         self.library.field_busy = true;
@@ -1163,43 +1266,31 @@ impl AppState {
                     let mut templates = service.templates().map_err(ui::error_text)?;
                     fill_default_templates(&mut templates);
                     let settings = service.provider_settings().map_err(ui::error_text)?;
-                    let report = service
-                        .translate_fields(&item_id, vec![kind], templates, settings)
+                    service
+                        .translate_fields_preview(&item_id, vec![kind], templates, settings)
                         .await
-                        .map_err(ui::error_text)?;
-                    let item = service
-                        .items(&library_id)
-                        .map_err(ui::error_text)?
-                        .into_iter()
-                        .find(|item| item.id == item_id);
-                    Ok((report, item))
+                        .map_err(ui::error_text)
                 })
             },
             move |this, result, window, cx| {
                 this.library.field_busy = false;
                 match result {
-                    Ok((report, Some(item))) => {
-                        this.log_translation_refresh(
-                            field,
-                            &item,
-                            this.field_unchanged(field, &item),
-                        );
-                        let unchanged = this.field_unchanged(field, &item);
-                        this.apply_item_snapshot(item, &[field], window, cx);
-                        if let Some((_, error)) = report.failed.first() {
-                            let message = translate_error(error);
-                            this.library.field_error = Some(message.clone().into());
-                            this.notify_toast(message, cx);
-                        } else if unchanged {
-                            this.notify_toast("翻译结果与原文相同，请检查模型/提示词", cx);
-                        } else {
-                            this.notify_toast("翻译完成，已更新译文", cx);
+                    Ok(field_preview) => {
+                        let unchanged = this.preview_unchanged(field, &field_preview);
+                        this.log_preview(field, &field_preview, unchanged);
+                        match this.apply_preview(field, &field_preview, window, cx) {
+                            Ok(()) => {
+                                if unchanged {
+                                    this.notify_toast("翻译结果与原文相同，请检查模型/提示词", cx);
+                                } else {
+                                    this.notify_toast("翻译完成，已填入译文（未保存）", cx);
+                                }
+                            }
+                            Err(message) => {
+                                this.library.field_error = Some(message.clone().into());
+                                this.notify_toast(message, cx);
+                            }
                         }
-                    }
-                    Ok((_, None)) => {
-                        let message = "无法读取最新条目以刷新译文，请重试".to_string();
-                        this.library.field_error = Some(message.clone().into());
-                        this.notify_toast(message, cx);
                     }
                     Err(message) => {
                         let message = translate_error(&message);

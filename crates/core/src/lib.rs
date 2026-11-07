@@ -70,6 +70,18 @@ pub struct ItemSource {
     pub people: Vec<PersonView>,
 }
 
+/// Translation result for the selected fields, without persisting anything.
+///
+/// Unselected fields are `None`; selected fields carry the translated value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FieldPreview {
+    pub title: Option<String>,
+    pub original_title: Option<String>,
+    pub overview: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub people: Option<Vec<PersonView>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonView {
     /// Jellyfin person item id, used for the avatar image; absent for people
@@ -675,6 +687,67 @@ impl AppService {
         .await
     }
 
+    /// Translate the selected fields without writing the store or changing the
+    /// item status.
+    ///
+    /// Same provider/templates/preset/People logic as [`Self::translate_fields`],
+    /// but the result is only returned to the caller (e.g. the edit dialog's
+    /// "preview" button); closing the dialog does not leave a draft behind.
+    pub async fn translate_fields_preview(
+        &self,
+        item_id: &str,
+        fields: Vec<FieldKind>,
+        templates: Templates,
+        settings: ProviderSettings,
+    ) -> Result<FieldPreview> {
+        let item = {
+            let inner = self.inner()?;
+            inner.store.get_item(item_id)?
+        };
+        let Some(item) = item else {
+            return Err(anyhow!("本地库中不存在条目 {item_id}"));
+        };
+        anyhow::ensure!(!item.locked, "条目 {item_id} 已锁定");
+
+        let fields = normalize_fields(&fields);
+        if fields.is_empty() {
+            return Ok(FieldPreview::default());
+        }
+
+        let translator = self.translator(&settings)?;
+        let presets = {
+            let inner = self.inner()?;
+            inner.store.presets()?
+        };
+        let preset_map = preset_lookup(&presets);
+        let outcome = translate_item(
+            translator.as_ref(),
+            &item,
+            &fields,
+            &templates,
+            &settings,
+            &preset_map,
+        )
+        .await?;
+
+        let has = |field: FieldKind| fields.contains(&field);
+        Ok(FieldPreview {
+            title: has(FieldKind::Title).then(|| outcome.draft.name.clone()),
+            original_title: has(FieldKind::OriginalTitle)
+                .then(|| outcome.draft.original_title.clone()),
+            overview: has(FieldKind::Overview).then(|| outcome.draft.overview.clone()),
+            tags: has(FieldKind::Tags).then(|| outcome.draft.tags.clone()),
+            people: has(FieldKind::People).then(|| {
+                outcome
+                    .draft
+                    .people
+                    .iter()
+                    .map(person_view)
+                    .collect::<Vec<_>>()
+            }),
+        })
+    }
+
     async fn translate_items(
         &self,
         translator: &dyn PromptTranslator,
@@ -695,10 +768,7 @@ impl AppService {
             }
             inner.store.presets()?
         };
-        let preset_map = presets
-            .iter()
-            .map(|preset| (normalize_preset_key(&preset.source), preset.target.clone()))
-            .collect::<HashMap<_, _>>();
+        let preset_map = preset_lookup(&presets);
 
         let mut report = TranslateReport {
             translated: 0,
@@ -1424,6 +1494,13 @@ fn source_text(primary: &Option<String>, draft: &Option<String>) -> String {
 
 fn normalize_preset_key(name: &str) -> String {
     name.trim().to_lowercase()
+}
+
+fn preset_lookup(presets: &[PresetRecord]) -> HashMap<String, String> {
+    presets
+        .iter()
+        .map(|preset| (normalize_preset_key(&preset.source), preset.target.clone()))
+        .collect()
 }
 
 fn record_translations(

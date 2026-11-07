@@ -1255,3 +1255,80 @@ async fn only_selected_libraries_are_visible_on_the_home_tab() {
         .unwrap();
     assert_eq!(service.libraries().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn translate_preview_returns_values_without_writing_the_store() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    let service = synced_service(&fake).await;
+    service
+        .upsert_preset("  leonardo dicaprio ", "莱昂纳多·迪卡普里奥")
+        .unwrap();
+    service.install_translator(EchoTranslator::new()).unwrap();
+
+    let preview = service
+        .translate_fields_preview(
+            "m1",
+            vec![FieldKind::Title, FieldKind::Tags, FieldKind::People],
+            templates(),
+            settings(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(preview.title.as_deref(), Some("[zh-CN] Inception"));
+    assert!(preview.original_title.is_none());
+    assert!(preview.overview.is_none());
+    assert_eq!(
+        preview.tags.unwrap(),
+        vec!["[zh-CN] Sci-Fi".to_string(), "[zh-CN] Heist".to_string()]
+    );
+    let people = preview.people.unwrap();
+    assert_eq!(people[0].id.as_deref(), Some("p1"));
+    assert_eq!(people[0].name, "莱昂纳多·迪卡普里奥");
+    assert_eq!(people[0].role.as_deref(), Some("[zh-CN] Dom Cobb"));
+
+    // Nothing was persisted: no draft, no status change, no audit rows and no
+    // preset usage increment.
+    let record = {
+        let inner = service.inner().unwrap();
+        assert!(inner.store.list_translations("m1").unwrap().is_empty());
+        inner.store.get_item("m1").unwrap().unwrap()
+    };
+    assert_eq!(record.status, store::STATUS_UNTRANSLATED);
+    assert!(record.draft_name.is_none());
+    assert!(record.draft_tags.is_none());
+    assert!(record.draft_people.is_none());
+
+    let item = service.items("movies").unwrap().remove(0);
+    assert_eq!(item.status, TranslationStatus::Untranslated);
+    assert_eq!(item.title, "Inception");
+    assert_eq!(service.presets().unwrap()[0].uses, 0);
+}
+
+#[tokio::test]
+async fn translate_preview_rejects_locked_items() {
+    let fake = FakeApi::new(
+        vec![library("movies", "Movies")],
+        vec![("movies".to_string(), movie("m1", "Inception"))],
+    );
+    let service = synced_service(&fake).await;
+    service.install_translator(EchoTranslator::new()).unwrap();
+    service.set_locked(&["m1".into()], true).unwrap();
+
+    let error = service
+        .translate_fields_preview("m1", vec![FieldKind::Title], templates(), settings())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("已锁定"), "unexpected error: {error}");
+
+    let record = {
+        let inner = service.inner().unwrap();
+        inner.store.get_item("m1").unwrap().unwrap()
+    };
+    assert_eq!(record.status, store::STATUS_UNTRANSLATED);
+    assert!(record.draft_name.is_none());
+}
