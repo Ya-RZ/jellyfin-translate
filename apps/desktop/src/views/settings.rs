@@ -278,6 +278,24 @@ impl AppState {
     }
 
     fn save_settings(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // Validate concurrency up front so an invalid value surfaces an error
+        // instead of silently falling back to the default (which left the input
+        // showing "abc" while the app actually used 4).
+        let concurrency_raw = self
+            .settings
+            .concurrency
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let concurrency = match concurrency_raw.parse::<usize>() {
+            Ok(value) if value >= 1 => value.clamp(1, 16),
+            _ => {
+                self.notify_toast("并发数无效，请输入 1–16 的整数", cx);
+                return;
+            }
+        };
+
         let settings = ProviderSettings {
             base_url: self.settings.base_url.read(cx).value().trim().to_string(),
             model: self.settings.model.read(cx).value().trim().to_string(),
@@ -296,15 +314,7 @@ impl AppState {
                 .value()
                 .trim()
                 .to_string(),
-            concurrency: self
-                .settings
-                .concurrency
-                .read(cx)
-                .value()
-                .trim()
-                .parse::<usize>()
-                .unwrap_or(4)
-                .max(1),
+            concurrency,
         };
 
         self.settings.saving = true;

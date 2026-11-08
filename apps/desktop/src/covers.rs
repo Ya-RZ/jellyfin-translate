@@ -217,6 +217,9 @@ fn decode(
         let _ = std::fs::create_dir_all(cache_dir);
         let _ = std::fs::write(cache_path(cache_dir, source, width, extension), &bytes);
     }
+    // `Image::from_bytes` only stores the format and bytes (it does not decode,
+    // so it cannot panic); the actual decode happens lazily at render time and
+    // simply shows nothing for a corrupt payload.
     Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 

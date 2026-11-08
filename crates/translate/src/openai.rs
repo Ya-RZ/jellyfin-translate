@@ -43,6 +43,35 @@ const ECHO_RETRY_INSTRUCTION: &str = concat!(
     "correct form in the target language."
 );
 
+/// HTTP-level failure carrying its status code so the retry loop can tell
+/// permanent client errors (4xx other than 429) from transient failures.
+#[derive(Debug)]
+struct HttpError {
+    status: reqwest::StatusCode,
+    message: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "openai: HTTP {}: {}", self.status.as_u16(), self.message)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// Whether a failed request is worth retrying. HTTP 4xx (except 429) is a
+/// permanent client error — retrying cannot help; everything else (transport
+/// errors, 429 rate limiting, 5xx, malformed content) is worth one retry.
+fn is_retryable(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<HttpError>() {
+        Some(http) => {
+            http.status.is_server_error()
+                || http.status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+        None => true,
+    }
+}
+
 pub struct OpenAiTranslator {
     base_url: String,
     api_key: String,
@@ -119,7 +148,11 @@ impl OpenAiTranslator {
             .map_err(|e| anyhow!("openai: failed to read response body: {e}"))?;
 
         if !status.is_success() {
-            bail!("openai: HTTP {}: {}", status.as_u16(), snippet(&raw));
+            return Err(HttpError {
+                status,
+                message: snippet(&raw),
+            }
+            .into());
         }
 
         let completion: ChatCompletion = serde_json::from_str(&raw)
@@ -276,6 +309,12 @@ impl OpenAiTranslator {
                         break;
                     }
                     Err(error) => {
+                        // Permanent client errors (4xx other than 429) are not
+                        // worth retrying: fail fast so a config mistake surfaces
+                        // immediately instead of after a pointless extra request.
+                        if !is_retryable(&error) {
+                            return Err(error);
+                        }
                         error_attempts += 1;
                         tracing::warn!(
                             provider = "openai",

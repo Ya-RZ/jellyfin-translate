@@ -1,6 +1,7 @@
 //! Unit tests for the service. Everything runs against in-memory SQLite and a
 //! fake Jellyfin API / translation provider — no network, no real server.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -324,6 +325,49 @@ impl PromptTranslator for EchoTranslator {
 // Fixtures
 // ---------------------------------------------------------------------------
 
+/// Echoes the input like [`EchoTranslator`], but holds each request for a short
+/// while and records how many were in flight at once, so a test can prove that
+/// `ProviderSettings.concurrency` really parallelizes item translation.
+#[derive(Default)]
+struct ConcurrencyProbe {
+    active: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl ConcurrencyProbe {
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+impl PromptTranslator for ConcurrencyProbe {
+    fn translate_with_prompt<'a>(
+        &'a self,
+        request: translate::TranslateRequest,
+        _prompt: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<translate::TranslateResponse>> {
+        Box::pin(async move {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+
+            let lang = request.target_lang.clone();
+            Ok(translate::TranslateResponse {
+                segments: request
+                    .segments
+                    .into_iter()
+                    .map(|segment| TranslatedSegment {
+                        id: segment.id,
+                        text: format!("[{lang}] {}", segment.text),
+                    })
+                    .collect(),
+                usage: Usage::default(),
+            })
+        })
+    }
+}
+
 fn library(id: &str, name: &str) -> jellyfin::Library {
     jellyfin::Library {
         id: id.to_string(),
@@ -615,6 +659,53 @@ async fn translate_reports_missing_items_and_requires_api_key() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("API key"), "unexpected error: {error}");
+}
+
+#[tokio::test]
+async fn translate_processes_multiple_items_concurrently() {
+    let movies = (1..=6)
+        .map(|i| {
+            (
+                "movies".to_string(),
+                movie(&format!("m{i}"), &format!("Movie {i}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let fake = FakeApi::new(vec![library("movies", "Movies")], movies);
+    let service = synced_service(&fake).await;
+
+    let probe = Arc::new(ConcurrencyProbe::default());
+    service.install_translator(probe.clone()).unwrap();
+
+    let mut provider = settings();
+    provider.concurrency = 3;
+    let report = service
+        .translate(
+            (1..=6).map(|i| format!("m{i}")).collect(),
+            templates(),
+            provider,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.translated, 6);
+    assert!(report.failed.is_empty());
+    assert!(
+        probe.peak() > 1,
+        "expected concurrent item translations, peak was {}",
+        probe.peak()
+    );
+
+    for i in 1..=6 {
+        let item = service
+            .items("movies")
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == format!("m{i}"))
+            .unwrap();
+        assert_eq!(item.title, format!("[zh-CN] Movie {i}"));
+        assert_eq!(item.status, TranslationStatus::Draft);
+    }
 }
 
 #[tokio::test]

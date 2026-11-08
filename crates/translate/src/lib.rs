@@ -1,7 +1,8 @@
 //! Translation providers and the shared request/response contract.
 //!
-//! Every provider implements [`Translator`]; the orchestration layer (retry,
-//! rate limiting, caching, glossary, cost accounting) lives above it.
+//! Every provider implements [`Translator`]. Cross-item concurrency, retries and
+//! persistence live in the `core` crate; the OpenAI adapter additionally retries
+//! one failed request and tolerates the JSON shapes models actually emit.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -59,32 +60,3 @@ pub mod openai;
 
 pub use mock::MockTranslator;
 pub use openai::OpenAiTranslator;
-
-/// Configuration for one provider, as stored by the GUI (secrets come from the
-/// OS keychain and are injected at construction time).
-///
-/// Only the OpenAI-compatible provider ships for now; adding another backend
-/// is a new variant plus a `Translator` implementation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ProviderConfig {
-    OpenAi {
-        base_url: String,
-        api_key: String,
-        model: String,
-    },
-    Mock,
-}
-
-impl ProviderConfig {
-    pub fn build(self) -> Result<Box<dyn Translator>> {
-        Ok(match self {
-            ProviderConfig::OpenAi {
-                base_url,
-                api_key,
-                model,
-            } => Box::new(OpenAiTranslator::new(base_url, api_key, model)?),
-            ProviderConfig::Mock => Box::new(MockTranslator::default()),
-        })
-    }
-}

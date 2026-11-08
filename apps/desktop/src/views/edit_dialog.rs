@@ -1269,7 +1269,16 @@ impl AppState {
                 if let Some(FieldEditorState::People { rows }) = self.library.field_editor.as_mut()
                 {
                     for (index, row) in rows.iter_mut().enumerate() {
-                        if let Some(person) = people.get(index) {
+                        // Match by id first so a reordered or partial model
+                        // result cannot write one actor's name onto another;
+                        // fall back to the positional entry only for rows that
+                        // carry no id.
+                        let person = row
+                            .id
+                            .as_deref()
+                            .and_then(|id| people.iter().find(|p| p.id.as_deref() == Some(id)))
+                            .or_else(|| people.get(index));
+                        if let Some(person) = person {
                             let value = person.name.clone();
                             row.name
                                 .update(cx, |state, cx| state.set_value(value, window, cx));

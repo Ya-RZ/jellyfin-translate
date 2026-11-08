@@ -352,9 +352,12 @@ impl Client {
     ) -> Result<()> {
         let item_id = path_segment("item id", item_id)?;
         let image_type = path_segment("image type", image_type)?;
+        let image_url = image_url.trim();
+        anyhow::ensure!(!image_url.is_empty(), "remote image URL must not be empty");
+        let lower = image_url.to_ascii_lowercase();
         anyhow::ensure!(
-            !image_url.trim().is_empty(),
-            "remote image URL must not be empty"
+            lower.starts_with("http://") || lower.starts_with("https://"),
+            "remote image URL must use http:// or https:// (got {image_url:?})"
         );
         let path = format!("/Items/{item_id}/RemoteImages/Download");
         let url = format!("{}{}", self.base_url, path);
@@ -372,12 +375,13 @@ impl Client {
 }
 
 /// Reject values that would alter the request path (e.g. `../System/Info`).
+/// `%` is rejected too: a percent-encoded slash would be decoded by the server.
 fn path_segment(what: &str, value: &str) -> Result<String> {
     anyhow::ensure!(!value.is_empty(), "{what} must not be empty");
     anyhow::ensure!(
-        !value
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '#')),
+        !value.chars().any(|c| c.is_control()
+            || c.is_whitespace()
+            || matches!(c, '/' | '\\' | '?' | '#' | '%')),
         "{what} {value:?} contains characters that are not allowed in a URL path segment"
     );
     Ok(value.to_string())
@@ -456,6 +460,7 @@ mod tests {
             "a b",
             "a?b",
             "a#b",
+            "a%b",
             "a\nb",
         ] {
             assert!(

@@ -17,7 +17,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// Item has never been translated or edited.
 pub const STATUS_UNTRANSLATED: &str = "untranslated";
@@ -197,20 +197,20 @@ impl Store {
         }
         let conn =
             Connection::open(path).with_context(|| format!("open sqlite {}", path.display()))?;
-        let store = Self { conn };
+        let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        let store = Self {
+        let mut store = Self {
             conn: Connection::open_in_memory()?,
         };
         store.migrate()?;
         Ok(store)
     }
 
-    pub fn migrate(&self) -> Result<()> {
+    pub fn migrate(&mut self) -> Result<()> {
         self.conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
@@ -308,14 +308,20 @@ impl Store {
 
     /// Older databases keyed presets by `source` alone. Rebuild the table with
     /// the `(kind, source)` key, defaulting every existing row to `person`.
-    fn migrate_presets(&self) -> Result<()> {
+    fn migrate_presets(&mut self) -> Result<()> {
         let has_kind: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('presets') WHERE name = 'kind'",
             [],
             |row| row.get(0),
         )?;
         if has_kind == 0 {
-            self.conn.execute_batch(
+            // Run the whole table rebuild inside one transaction so a crash or
+            // failure between `DROP TABLE presets` and the `RENAME` cannot leave
+            // the database with `presets` gone but `presets_new` never renamed
+            // (which would make every subsequent `open()` fail with "no such
+            // table: presets"). SQLite makes this DDL sequence atomic.
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(
                 r#"
                 DROP INDEX IF EXISTS idx_presets_normalized;
                 CREATE TABLE presets_new (
@@ -331,6 +337,7 @@ impl Store {
                 ALTER TABLE presets_new RENAME TO presets;
                 "#,
             )?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -342,8 +349,11 @@ impl Store {
             |row| row.get(0),
         )?;
         if exists == 0 {
-            self.conn
-                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+            // `table` / `column` are compile-time literals here; quote them so a
+            // future call site cannot accidentally produce broken SQL.
+            self.conn.execute_batch(&format!(
+                "ALTER TABLE \"{table}\" ADD COLUMN \"{column}\" {decl}"
+            ))?;
         }
         Ok(())
     }
@@ -551,6 +561,7 @@ impl Store {
     }
 
     fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRecord> {
+        let id: String = row.get(0)?;
         let tags_json: String = row.get(6)?;
         let people_json: String = row.get(7)?;
         let locked_json: String = row.get(9)?;
@@ -561,18 +572,18 @@ impl Store {
         let draft_sort_name: Option<String> = row.get(21)?;
         let draft_genres_json: Option<String> = row.get(22)?;
         Ok(ItemRecord {
-            id: row.get(0)?,
+            id: id.clone(),
             library_id: row.get(1)?,
             item_type: row.get(2)?,
             name: row.get(3)?,
             original_title: row.get(4)?,
             sort_name,
-            genres: serde_json::from_str(&genres_json).unwrap_or_default(),
+            genres: parse_json_column(&genres_json, "genres_json", &id),
             overview: row.get(5)?,
-            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            people: serde_json::from_str(&people_json).unwrap_or_default(),
+            tags: parse_json_column(&tags_json, "tags_json", &id),
+            people: parse_json_column(&people_json, "people_json", &id),
             image_tag: row.get(8)?,
-            locked_fields: serde_json::from_str(&locked_json).unwrap_or_default(),
+            locked_fields: parse_json_column(&locked_json, "locked_fields_json", &id),
             source_hash: row.get(10)?,
             synced_at: row.get(11)?,
             status: row.get(12)?,
@@ -582,14 +593,14 @@ impl Store {
             draft_sort_name,
             draft_genres: draft_genres_json
                 .as_deref()
-                .map(|raw| serde_json::from_str(raw).unwrap_or_default()),
+                .map(|raw| parse_json_column(raw, "draft_genres_json", &id)),
             draft_overview: row.get(16)?,
             draft_tags: draft_tags_json
                 .as_deref()
-                .map(|raw| serde_json::from_str(raw).unwrap_or_default()),
+                .map(|raw| parse_json_column(raw, "draft_tags_json", &id)),
             draft_people: draft_people_json
                 .as_deref()
-                .map(|raw| serde_json::from_str(raw).unwrap_or_default()),
+                .map(|raw| parse_json_column(raw, "draft_people_json", &id)),
         })
     }
 
@@ -810,6 +821,25 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+}
+
+/// Decode a JSON column, warning instead of silently dropping a corrupt value.
+///
+/// An empty list is recoverable, but the data problem must stay visible in the
+/// logs: silently returning `[]` once hid "all tags/people disappeared".
+fn parse_json_column<T: DeserializeOwned + Default>(raw: &str, column: &str, item_id: &str) -> T {
+    match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                item = %item_id,
+                column,
+                error = %error,
+                "items 表的 JSON 列损坏，按空值处理"
+            );
+            T::default()
+        }
     }
 }
 
@@ -1190,7 +1220,7 @@ mod tests {
 
     #[test]
     fn migration_is_idempotent() {
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         store.migrate().unwrap();
     }

@@ -509,8 +509,19 @@ impl AppService {
             return Err(error);
         }
         if let Err(error) = std::fs::rename(&tmp, &path) {
+            // Some Windows setups refuse to replace an existing file on rename
+            // (AV/backup handles). Fall back to an in-place copy so the config
+            // stays writable; atomicity is lost only on this retry path.
+            let copied = std::fs::copy(&tmp, &path);
             let _ = std::fs::remove_file(&tmp);
-            return Err(error).with_context(|| format!("替换 {}", path.display()));
+            if let Err(copy_error) = copied {
+                return Err(error).with_context(|| {
+                    format!(
+                        "替换 {} 失败（回退 copy 也失败：{copy_error}）",
+                        path.display()
+                    )
+                });
+            }
         }
         Ok(())
     }
@@ -743,7 +754,7 @@ impl AppService {
             return Ok(TranslateReport::default());
         }
         let translator = self.translator(&settings)?;
-        self.translate_items(translator.as_ref(), ids, &ALL_FIELDS, &templates, &settings)
+        self.translate_items(translator, ids, &ALL_FIELDS, &templates, &settings)
             .await
     }
 
@@ -764,7 +775,7 @@ impl AppService {
         }
         let translator = self.translator(&settings)?;
         self.translate_items(
-            translator.as_ref(),
+            translator,
             vec![item_id.to_string()],
             &fields,
             &templates,
@@ -836,9 +847,15 @@ impl AppService {
         })
     }
 
+    /// Translate the given items, at most `settings.concurrency` at a time.
+    ///
+    /// Each item still performs its own sequential provider calls; the semaphore
+    /// bounds how many items are in flight. Results (draft + audit rows) are
+    /// written one by one on the current task, so the store lock is never held
+    /// across an `.await`.
     async fn translate_items(
         &self,
-        translator: &dyn PromptTranslator,
+        translator: Arc<dyn PromptTranslator>,
         ids: Vec<String>,
         fields: &[FieldKind],
         templates: &Templates,
@@ -858,27 +875,54 @@ impl AppService {
         };
         let preset_lookup = preset_lookup(&presets);
 
+        // Locked items are skipped entirely: no provider call, no store write.
+        let pending = items
+            .into_iter()
+            .filter(|item| {
+                if item.locked {
+                    tracing::debug!(item = %item.id, "skip locked item");
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>();
+
         let mut report = TranslateReport {
             translated: 0,
             failed,
         };
         let mut used_presets = Vec::new();
 
-        for item in items {
-            if item.locked {
-                tracing::debug!(item = %item.id, "skip locked item");
-                continue;
-            }
-            match translate_item(
-                translator,
-                &item,
-                fields,
-                templates,
-                settings,
-                &preset_lookup,
-            )
-            .await
-            {
+        let concurrency = settings.concurrency.clamp(1, 16);
+        tracing::debug!(concurrency, items = pending.len(), "translating items");
+        let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut tasks = tokio::task::JoinSet::new();
+        for item in pending {
+            let permit = permits.clone().acquire_owned().await?;
+            let translator = translator.clone();
+            let fields = fields.to_vec();
+            let templates = templates.clone();
+            let settings = settings.clone();
+            let presets = preset_lookup.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                let outcome = translate_item(
+                    translator.as_ref(),
+                    &item,
+                    &fields,
+                    &templates,
+                    &settings,
+                    &presets,
+                )
+                .await;
+                (item, outcome)
+            });
+        }
+
+        while let Some(joined) = tasks.join_next().await {
+            let (item, outcome) = joined.map_err(|error| anyhow!("翻译任务异常终止：{error}"))?;
+            match outcome {
                 Ok(outcome) => {
                     {
                         let mut inner = self.inner()?;
@@ -1361,12 +1405,13 @@ fn parse_preset_kind(raw: &str) -> PresetKind {
 /// the matching snapshot entry so write-back preserves them.
 fn merge_people(existing: &[PersonRecord], edit: Vec<PersonView>) -> Vec<PersonRecord> {
     edit.into_iter()
-        .enumerate()
-        .map(|(index, person)| {
+        .map(|person| {
             let id = person.id.clone();
-            // Prefer an explicit id, then the same (normalized) name, then the
-            // positional entry. This survives deleting an entry above without
-            // shifting ids/types onto the wrong actor.
+            // Prefer an explicit id, then the same (normalized) name. A person
+            // that matches neither is a newly added entry: keep `id = None`
+            // instead of falling back to the positional entry, otherwise the new
+            // actor would inherit the id/type of whoever happened to sit at the
+            // same index and overwrite them on write-back.
             let base = id
                 .as_deref()
                 .and_then(|id| existing.iter().find(|base| base.id.as_deref() == Some(id)))
@@ -1375,10 +1420,9 @@ fn merge_people(existing: &[PersonRecord], edit: Vec<PersonView>) -> Vec<PersonR
                     existing
                         .iter()
                         .find(|base| normalize_preset_key(&base.name) == key)
-                })
-                .or_else(|| existing.get(index));
+                });
             PersonRecord {
-                id: id.or_else(|| base.and_then(|base| base.id.clone())),
+                id,
                 name: person.name,
                 role: person.role,
                 person_type: base.and_then(|base| base.person_type.clone()),
@@ -1764,7 +1808,7 @@ fn normalize_preset_key(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PresetLookup {
     person: HashMap<String, String>,
     tag: HashMap<String, String>,
@@ -2056,13 +2100,14 @@ fn merge_people_json(existing: Option<&Value>, people: &[PersonRecord]) -> Vec<V
 
     people
         .iter()
-        .enumerate()
-        .map(|(index, person)| {
+        .map(|person| {
+            // Match by id only: a person without an id is a newly added entry
+            // and must not fall back to the positional entry, which would copy
+            // another actor's Id/Type onto it.
             let base = person
                 .id
                 .as_deref()
-                .and_then(|id| by_id.get(id).copied())
-                .or_else(|| existing_people.get(index));
+                .and_then(|id| by_id.get(id).copied());
             let mut entry = base.and_then(Value::as_object).cloned().unwrap_or_default();
             entry.insert("Name".to_string(), json!(person.name));
             match &person.role {
@@ -2125,6 +2170,14 @@ impl AppService {
             );
         }
 
+        if let Some(expected) = &expected.sort_name {
+            let actual = after.get("SortName").and_then(Value::as_str).unwrap_or("");
+            anyhow::ensure!(
+                actual == expected,
+                "读回校验失败：SortName 期望 {expected:?}，实际 {actual:?}"
+            );
+        }
+
         if let Some(expected) = &expected.original_title {
             let actual = after
                 .get("OriginalTitle")
@@ -2158,6 +2211,23 @@ impl AppService {
             anyhow::ensure!(
                 actual_tags == *expected_tags,
                 "读回校验失败：Tags 期望 {expected_tags:?}，实际 {actual_tags:?}"
+            );
+        }
+
+        if let Some(expected_genres) = &expected.genres {
+            let actual_genres = after
+                .get("Genres")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            anyhow::ensure!(
+                actual_genres == *expected_genres,
+                "读回校验失败：Genres 期望 {expected_genres:?}，实际 {actual_genres:?}"
             );
         }
 
